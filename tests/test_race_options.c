@@ -52,6 +52,45 @@ static void ABI modifiers_native_mock(void *kart, float dt) {
     float value=.6f; memcpy((unsigned char *)kart+0x190,&value,4);
     put_int(kart,0x194,9999);
 }
+
+/* e4a220 above 1.05 x top: the deceleration curve starts again at each call, speed * C2(dt*rate/T),
+ * with a curve that is steep at 0 (sqrt), as the native ease-out curves are. */
+static float ABI overspeed_native_mock(void *kart, void *data, int kind, float speed, float dt) {
+    (void)kind;
+    const float top=real(kart,0x190)*real(data,12);
+    if (speed<=1.05f*top) return speed;
+    const float rate=1+10*(speed/top-1), t=dt*rate/2.f;
+    return speed*(1-.25f*sqrtf(fminf(t,1)));
+}
+static float native_tenth(unsigned char *kart, unsigned char *data, float speed, int fps) {
+    for (int i=0;i<fps/10;++i) speed=overspeed_native_mock(kart,data,2,speed,1.f/(float)fps);
+    return speed;
+}
+static float hooked_tenth(unsigned char *kart, unsigned char *data, float speed, int fps) {
+    for (int i=0;i<fps/10;++i) speed=kart_speed(kart,data,2,speed,1.f/(float)fps);
+    return speed;
+}
+static void test_high_fps_overspeed(void) {
+    unsigned char kart[0x280]={0}, data[0x30]={0};
+    const float multiplier=.5f, base=200; /* off-road: top speed 100 */
+    memcpy(kart+0x190,&multiplier,4); memcpy(data+12,&base,4);
+    KartSpeed saved=native_kart_speed; native_kart_speed=overspeed_native_mock;
+    reset_ai_physics();
+    const float at60=native_tenth(kart,data,150,60);
+    /* 60 FPS: the native result, call for call. */
+    assert(hooked_tenth(kart,data,150,60)==at60);
+    assert(kart_speed(kart,data,2,150,1.f/30)==overspeed_native_mock(kart,data,2,150,1.f/30));
+    /* A tenth of a second: native at 120/240 FPS loses clearly more than at 60 (104 against
+     * 113); the hook stays within 1%. */
+    for (int fps=120;fps<=240;fps*=2) {
+        const float native=native_tenth(kart,data,150,fps), hooked=hooked_tenth(kart,data,150,fps);
+        assert(native<at60-2);
+        assert(fabsf(hooked-at60)<.01f*at60);
+    }
+    /* Below 1.05 x top (and when accelerating) native stays in charge. */
+    assert(kart_speed(kart,data,2,104,1.f/240)==104);
+    native_kart_speed=saved;
+}
 static void test_ai_physics(void) {
     unsigned char game[0x150]={0}, diff[32]={0}, race[0xd50]={0};
     unsigned char ai[0x80]={0}, control[0x80]={0}, kart[0x280]={0}, human[0x280]={0};
@@ -1365,6 +1404,7 @@ int main(void) {
     test_dynamic_speed();
     manager = &default_race_ptr;
     test_ai_physics();
+    test_high_fps_overspeed();
     manager = &default_race_ptr;
     test_reserves();
     manager = &default_race_ptr;

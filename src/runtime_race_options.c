@@ -374,6 +374,41 @@ static float kart_speed_scale(void *kart, int level, int itemless) {
         if (ai_physics[i].kart==kart) { id=ai_physics[i].id; break; }
     return ai_speed_scale(level,itemless,now_fn ? now_fn(timer) : 0,id);
 }
+/* Above 60 FPS a kart faster than its top speed (on a slow surface, or pushed by gravity down
+ * a slope) lost more speed per second. e4a220 then takes the speed itself as the scale and
+ * starts the deceleration curve again at every call: the result is speed * C2(dt * rate / T),
+ * so the loss per second depends on how many frames there are unless C2 is linear at 0.
+ * At frame times under 1/60 s the step a 60 FPS frame takes is spread over the frame times
+ * instead: start * (step(1/60) / start)^(dt * 60). 60 FPS and slower are unchanged.
+ * BB_HIGH_FPS_PHYSICS=0 keeps the native result at every frame rate. */
+#define REFERENCE_FRAME (1.f / 60.f)
+#define OVERSPEED_RATIO 1.05f /* e4a220 decelerates above 1.05 times its top speed */
+static int high_fps_physics(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("BB_HIGH_FPS_PHYSICS");
+        enabled = !(env && env[0] == '0');
+    }
+    return enabled;
+}
+static float frame_rate_speed(void *kart, void *data, int kind, float speed, float dt) {
+    const float result = native_kart_speed(kart, data, kind, speed, dt);
+    if (!high_fps_physics() || !kart || !data || !(dt > 0) || dt >= REFERENCE_FRAME * .999f ||
+        !(speed > 0) || !isfinite(speed) || !isfinite(result) || result >= speed)
+        return result;
+    const float top = real(kart, 0x190) * real(data, 12); /* modifiers * base speed, as native */
+    if (!(top > 0) || !isfinite(top) || speed <= OVERSPEED_RATIO * top) return result;
+    /* No step: the speed the curve starts from (native may first strip the additive boost
+     * speed, which is not a per-frame loss and must not be spread). */
+    const float start = native_kart_speed(kart, data, kind, speed, 0);
+    const float reference = native_kart_speed(kart, data, kind, speed, REFERENCE_FRAME);
+    if (!(start > 0) || !isfinite(start) || !isfinite(reference) || !(reference > 0) ||
+        reference > start)
+        return result;
+    const float spread = start * powf(reference / start, dt / REFERENCE_FRAME);
+    return isfinite(spread) ? spread : result;
+}
+
 /* Native e4a220 reads speed-data +c and curve pointers +18/+20/+28.
  * A call-local view changes AI base speed without mutating a shared archetype. */
 static float ABI kart_speed(void *kart, void *data, int kind, float speed, float dt) {
@@ -388,10 +423,10 @@ static float ABI kart_speed(void *kart, void *data, int kind, float speed, float
                itemless ? "ghost-traffic" : "native",level,scale,itemless);
     }
     if (scale==1 || !data || !isfinite(real(data,12)) || real(data,12)<=0)
-        return native_kart_speed(kart,data,kind,speed,dt);
+        return frame_rate_speed(kart,data,kind,speed,dt);
     unsigned char tuned[0x30]; memcpy(tuned,data,sizeof tuned);
     float top=real(data,12)*scale; memcpy(tuned+12,&top,4);
-    return native_kart_speed(kart,tuned,kind,speed,dt);
+    return frame_rate_speed(kart,tuned,kind,speed,dt);
 }
 /* e452c0 expires native modifiers and combines positive multipliers with the
  * strongest slowdown. Itemless AI retains positives and ignores that slowdown. */
