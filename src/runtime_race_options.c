@@ -415,12 +415,62 @@ static float frame_rate_speed(void *kart, void *data, int kind, float speed, flo
  * pull the kart down faster. Under 1/60 s, k^(dt * 60) keeps the blend per second as at 60 FPS.
  * dt is the last frame time kart_speed saw: e46250 calls it each frame before the blend. */
 static float last_kart_dt;
-static float ABI terrain_blend(float k) {
+static float logged_k = -1, logged_blend = -1; /* last terrain k, native and used (physics log) */
+static float terrain_choice(float k) {
     const float dt = last_kart_dt;
     if (!high_fps_physics() || !(dt > 0) || dt >= REFERENCE_FRAME * .999f || !(k > 0) || !(k < 1))
         return k;
     const float blended = powf(k, dt / REFERENCE_FRAME);
     return isfinite(blended) ? blended : k;
+}
+static float ABI terrain_blend(float k) {
+    const float used = terrain_choice(k);
+    logged_k = k; logged_blend = used;
+    return used;
+}
+
+/* BB_PHYSICS_LOG=<file.csv>: during a physics test (F10, see runtime_pad.c) one row per kart
+ * and frame, from the race start: kart, game time, dt, speed before and after e4a220, top speed,
+ * terrain k native/used, position. scripts/physics_compare.py compares runs at two frame rates
+ * by distance driven. The first kart to move after F10 starts the test clock. */
+static FILE *physics_log;
+static void *log_karts[8];
+static double log_time[8];
+static void physics_log_row(void *kart, void *data, int kind, float speed, float dt, float out) {
+    int state = runtime_pad_test_state();
+    if (state == 1 && out > .01f) { runtime_pad_kart_moving(); state = runtime_pad_test_state(); }
+    static int was_running;
+    if (state != 2) {
+        if (was_running && physics_log) fflush(physics_log);
+        was_running = 0;
+        return;
+    }
+    if (!was_running) { /* a new run: forget the karts of the last one */
+        memset(log_karts, 0, sizeof log_karts); memset(log_time, 0, sizeof log_time);
+        static int opened;
+        if (!opened) {
+            opened = 1;
+            const char *path = getenv("BB_PHYSICS_LOG");
+            if (path && *path && (physics_log = fopen(path, "w")))
+                printf("Native physics: test log %s\n", path);
+        }
+        if (physics_log)
+            fprintf(physics_log, "# run high_fps_physics=%d\nkart,kind,t,dt,speed,out,top,k,k_used,x,y,z\n",
+                    high_fps_physics());
+        was_running = 1;
+    }
+    if (!physics_log || !kart) return;
+    unsigned slot = 0;
+    while (slot < 8 && log_karts[slot] && log_karts[slot] != kart) ++slot;
+    if (slot == 8) return;
+    log_karts[slot] = kart;
+    if (dt > 0 && dt < 1) log_time[slot] += dt;
+    float where[3] = {0, 0, 0};
+    void *entity = ptr(kart, 0x18);
+    if (world_position && entity) world_position(where, entity);
+    const float top = data ? real(kart, 0x190) * real(data, 12) : 0;
+    fprintf(physics_log, "%u,%d,%.5f,%.6f,%.4f,%.4f,%.4f,%.5f,%.5f,%.3f,%.3f,%.3f\n", slot, kind, log_time[slot],
+            dt, speed, out, top, logged_k, logged_blend, where[0], where[1], where[2]);
 }
 /* Replaces e47205 (vmovss xmm2,[rdx] .. jmp e46ac1). Saves every caller-saved register,
  * calls terrain_blend(*rdx) with an aligned stack, then runs the original blend with the
@@ -465,11 +515,16 @@ static float ABI kart_speed(void *kart, void *data, int kind, float speed, float
         printf("Native AI: driving policy route=%s level=%d dynamic_base_speed_scale=%.3f cycle_seconds=16 ignore_slow_surfaces=%d\n",
                itemless ? "ghost-traffic" : "native",level,scale,itemless);
     }
-    if (scale==1 || !data || !isfinite(real(data,12)) || real(data,12)<=0)
-        return frame_rate_speed(kart,data,kind,speed,dt);
-    unsigned char tuned[0x30]; memcpy(tuned,data,sizeof tuned);
-    float top=real(data,12)*scale; memcpy(tuned+12,&top,4);
-    return frame_rate_speed(kart,tuned,kind,speed,dt);
+    float out;
+    if (scale==1 || !data || !isfinite(real(data,12)) || real(data,12)<=0) {
+        out=frame_rate_speed(kart,data,kind,speed,dt);
+    } else {
+        unsigned char tuned[0x30]; memcpy(tuned,data,sizeof tuned);
+        float top=real(data,12)*scale; memcpy(tuned+12,&top,4);
+        out=frame_rate_speed(kart,tuned,kind,speed,dt);
+    }
+    physics_log_row(kart,data,kind,speed,dt,out);
+    return out;
 }
 /* e452c0 expires native modifiers and combines positive multipliers with the
  * strongest slowdown. Itemless AI retains positives and ignores that slowdown. */

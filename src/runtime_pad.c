@@ -945,6 +945,7 @@ static void read_inject(void) {
  * "replay" in BB_PAD_FILE (scripted tests repeat a route the player ran once). Lines: ms buttons
  * lx ly rx ry l2 r2, written when the state changes. */
 typedef struct { uint32_t ms, buttons; uint8_t axes[4], l2, r2; } PadSample;
+static int test_record, test_replay; /* physics test (F10), see test_key below */
 static FILE *record_file;
 static uint64_t record_start;
 static PadSample record_last;
@@ -965,7 +966,7 @@ static void record_sample(const PadData *d) {
         }
     }
     f9_was_down=f9;
-    if (!record_file) return;
+    if (!record_file || test_record==1) return;
     PadSample s={(uint32_t)((now_us()-record_start)/1000),d->buttons,
                  {d->left_x,d->left_y,d->right_x,d->right_y},d->l2,d->r2};
     if (s.buttons==record_last.buttons && !memcmp(s.axes,record_last.axes,4) &&
@@ -976,22 +977,76 @@ static void record_sample(const PadData *d) {
     fflush(record_file);
 }
 static PadSample *replay; static size_t replay_count, replay_next;
+/* Physics test (F10): the recording or the replay waits until a kart first moves, which
+ * runtime_race_options reports at the race start, so every run starts at the same instant
+ * whatever the frame rate. While a replay waits, its first sample is held (the throttle held
+ * through the countdown). 0 off, 1 waiting for the start, 2 running. */
+static void load_replay(void);
+static void test_key(void) {
+    static int f10_was_down;
+    if (!sdl_ready) return;
+    const bool *k=SDL_GetKeyboardState(NULL);
+    const int f10=k && k[SDL_SCANCODE_F10];
+    if (f10 && !f10_was_down) {
+        const char *record=getenv("BB_PAD_RECORD"), *play=getenv("BB_PAD_REPLAY");
+        if (test_record || test_replay) {
+            if (record_file) { fclose(record_file); record_file=NULL; }
+            test_record=test_replay=0; replay_armed=0;
+            puts("Runtime: physics test stopped");
+        } else if (play && *play) {
+            load_replay();
+            if (replay_count) { test_replay=1; replay_armed=1; replay_start=0; }
+            puts(replay_count ? "Runtime: physics test: replay waits for the race start" :
+                                "Runtime: physics test: the replay file has no samples");
+        } else if (record && *record && (record_file=fopen(record,"w"))) {
+            test_record=1;
+            printf("Runtime: physics test: recording to %s from the race start (F10 stops)\n",record);
+        }
+    }
+    f10_was_down=f10;
+}
+void runtime_pad_kart_moving(void) {
+    if (test_record==1) {
+        record_start=now_us(); memset(&record_last,0xff,sizeof(record_last)); test_record=2;
+        puts("Runtime: physics test: race started, recording");
+    }
+    if (test_replay==1) {
+        replay_start=now_us(); replay_next=0; test_replay=2;
+        puts("Runtime: physics test: race started, replaying");
+    }
+}
+int runtime_pad_test_state(void) {
+    return test_record==1 || test_replay==1 ? 1 : test_record==2 || test_replay==2 ? 2 : 0;
+}
+static void load_replay(void) {
+    static int loaded;
+    if (loaded) return;
+    loaded=1;
+    const char *path=getenv("BB_PAD_REPLAY");
+    FILE *f=path ? fopen(path,"r") : NULL;
+    PadSample s; unsigned v[8]; size_t cap=0;
+    while (f && fscanf(f,"%u %u %u %u %u %u %u %u",&v[0],&v[1],&v[2],&v[3],&v[4],&v[5],&v[6],&v[7])==8) {
+        s=(PadSample){v[0],v[1],{(uint8_t)v[2],(uint8_t)v[3],(uint8_t)v[4],(uint8_t)v[5]},(uint8_t)v[6],(uint8_t)v[7]};
+        if (replay_count==cap && !(replay=realloc(replay,(cap=cap ? cap*2 : 1024)*sizeof(*replay)))) break;
+        replay[replay_count++]=s;
+    }
+    if (f) fclose(f);
+    printf("Runtime: pad replay of %zu samples from %s\n",replay_count,path ? path : "(unset)");
+}
 static void replay_sample(PadData *d) {
     if (!replay_armed) return;
+    if (test_replay==1) { /* hold the first sample until the race starts */
+        const PadSample *s=&replay[0];
+        d->buttons=s->buttons;
+        d->left_x=s->axes[0]; d->left_y=s->axes[1]; d->right_x=s->axes[2]; d->right_y=s->axes[3];
+        d->l2=s->l2; d->r2=s->r2;
+        return;
+    }
     if (!replay_start) {
         static int loaded;
         if (!loaded) {
             loaded=1;
-            const char *path=getenv("BB_PAD_REPLAY");
-            FILE *f=path ? fopen(path,"r") : NULL;
-            PadSample s; unsigned v[8]; size_t cap=0;
-            while (f && fscanf(f,"%u %u %u %u %u %u %u %u",&v[0],&v[1],&v[2],&v[3],&v[4],&v[5],&v[6],&v[7])==8) {
-                s=(PadSample){v[0],v[1],{(uint8_t)v[2],(uint8_t)v[3],(uint8_t)v[4],(uint8_t)v[5]},(uint8_t)v[6],(uint8_t)v[7]};
-                if (replay_count==cap && !(replay=realloc(replay,(cap=cap ? cap*2 : 1024)*sizeof(*replay)))) break;
-                replay[replay_count++]=s;
-            }
-            if (f) fclose(f);
-            printf("Runtime: pad replay of %zu samples from %s\n",replay_count,path ? path : "(unset)");
+            load_replay();
         }
         replay_start=now_us();
         replay_next=0;
@@ -1000,7 +1055,7 @@ static void replay_sample(PadData *d) {
     while (replay_next<replay_count && replay[replay_next].ms<=ms) ++replay_next;
     if (!replay_next) return;
     if (replay_next==replay_count && ms>replay[replay_count-1].ms+500) {
-        if (replay_armed==1) { puts("Runtime: pad replay finished"); replay_armed=2; }
+        if (replay_armed==1) { puts("Runtime: pad replay finished"); replay_armed=2; test_replay=0; }
         return;
     }
     const PadSample *s=&replay[replay_next-1];
@@ -1026,6 +1081,7 @@ static void touch_ids(PadData *d) {
 static void sample(PadData *d) {
     sample_host(d);
     if (bbgpu_overlay_captures_input()) return;
+    test_key();
     record_sample(d);
     read_inject();
     replay_sample(d);
