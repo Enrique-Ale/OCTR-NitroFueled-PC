@@ -414,6 +414,22 @@ stacks; 0 = never), `BB_GAME_DIR`, `BB_USER_DIR`, `BB_DATA_DIR`, `BB_CONFIG`, `B
 than the Steam Deck has). bbport's temporal upscalers (`BB_UPSCALER`, `BB_OBJECT_MOTION`,
 `BB_UPSCALER_MENU=1` for their menu sections) were built for Bloodborne's scene and stay off.
 
+### Physics test at two frame rates
+
+Records one route and replays it at other frame limits, logging the kart every frame, so a frame
+rate dependence shows up as numbers instead of a feeling.
+
+1. Record: set `BB_PAD_RECORD=ruta.txt`, start a Time Trial, press F10 on the grid, hold the
+   throttle through the countdown and drive the stretch to test. Press F10 to stop.
+2. Replay: set `BB_PAD_REPLAY=ruta.txt` and `BB_PHYSICS_LOG=fisica-60.csv`, start the same Time
+   Trial at 60 FPS and press F10 on the grid. The replay holds the throttle and starts when the
+   karts move. Repeat at 144 FPS (`fisica-144.csv`) and with `BB_HIGH_FPS_PHYSICS=0`.
+3. Compare: `python scripts/physics_compare.py fisica-60.csv fisica-144.csv fisica-144-sin.csv`
+   prints the time and speed at points along the route, and the time difference against the first
+   file.
+
+Compare replays with replays: the recording itself may include a start boost the replays do not.
+
 ## Repository layout
 
 | Path | Contents |

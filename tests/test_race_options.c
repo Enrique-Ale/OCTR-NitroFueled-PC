@@ -6,6 +6,9 @@ static int cup, private_room = 1, itemless, stale_private_ui, battle_menu;
 static unsigned char default_race[0xd50];
 static void *default_race_ptr = default_race;
 int runtime_speed_race_active(void) { return itemless; }
+static int pad_test_state, pad_moving_calls;
+int runtime_pad_test_state(void) { return pad_test_state; }
+void runtime_pad_kart_moving(void) { ++pad_moving_calls; pad_test_state = 2; }
 int runtime_online_mode_in_private(void) { return private_room || stale_private_ui; }
 int runtime_private_match_active(void) { return private_room; }
 int runtime_online_mode_private_single_options(void) { return private_room && !cup && !battle_menu; }
@@ -69,6 +72,31 @@ static float native_tenth(unsigned char *kart, unsigned char *data, float speed,
 static float hooked_tenth(unsigned char *kart, unsigned char *data, float speed, int fps) {
     for (int i=0;i<fps/10;++i) speed=kart_speed(kart,data,2,speed,1.f/(float)fps);
     return speed;
+}
+static void test_physics_log(void) {
+    const char *path = "race-options-physics-log.csv";
+    setenv("BB_PHYSICS_LOG", path, 1);
+    unsigned char kart[0x200] = {0}, data[0x30] = {0};
+    const float multiplier = 1, base = 100;
+    memcpy(kart + 0x190, &multiplier, 4); memcpy(data + 12, &base, 4);
+    physics_log_row(kart, data, 0, 0, 1.f / 144, 0);     /* off: nothing */
+    pad_test_state = 1;
+    physics_log_row(kart, data, 0, 0, 1.f / 144, 0);     /* countdown: still waiting */
+    assert(pad_moving_calls == 0);
+    physics_log_row(kart, data, 0, 0, 1.f / 144, 2);     /* race start */
+    assert(pad_moving_calls == 1 && pad_test_state == 2);
+    physics_log_row(kart, data, 0, 2, 1.f / 144, 4);
+    pad_test_state = 0;
+    physics_log_row(kart, data, 0, 4, 1.f / 144, 6);     /* stopped: flushed, no row */
+    FILE *f = fopen(path, "r"); assert(f);
+    char line[256]; int rows = 0, header = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '#') continue;
+        if (!strncmp(line, "kart,", 5)) { ++header; continue; }
+        ++rows;
+    }
+    fclose(f); unlink(path); unsetenv("BB_PHYSICS_LOG");
+    assert(header == 1 && rows == 2);
 }
 static void test_high_fps_terrain_blend(void) {
     /* Grass pulls speed toward its target by (1-k) per frame: per second it must not
@@ -1420,6 +1448,7 @@ int main(void) {
     test_ai_physics();
     test_high_fps_overspeed();
     test_high_fps_terrain_blend();
+    test_physics_log();
     manager = &default_race_ptr;
     test_reserves();
     manager = &default_race_ptr;

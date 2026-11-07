@@ -156,6 +156,10 @@ uintptr_t runtime_audio_resolve(const char *name);
 void runtime_audio_report(void);
 uintptr_t runtime_pad_resolve(const char *name);
 void runtime_pad_report(void);
+/* Physics test (F10, BB_PAD_RECORD / BB_PAD_REPLAY): runtime_race_options reports the race start
+ * (a kart first moves); the state is 0 off, 1 waiting for the start, 2 running. */
+void runtime_pad_kart_moving(void);
+int runtime_pad_test_state(void);
 /* SacredFire: controller ports for split screen. Port 1 is the player's pad (keyboard too); ports
  * 2..4 take the gamepad named in bbport.ini (port.N=<GUID or part of the name>, written by the
  * in-game menu) and appear to the game as logged-in users 2..4 while that gamepad is connected. */
