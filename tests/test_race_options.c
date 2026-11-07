@@ -70,6 +70,20 @@ static float hooked_tenth(unsigned char *kart, unsigned char *data, float speed,
     for (int i=0;i<fps/10;++i) speed=kart_speed(kart,data,2,speed,1.f/(float)fps);
     return speed;
 }
+static void test_high_fps_terrain_blend(void) {
+    /* Grass pulls speed toward its target by (1-k) per frame: per second it must not
+     * depend on the frame rate, and 60 FPS must keep the native k. */
+    const float k = .9f, old = 100, target = 50;
+    last_kart_dt = 1.f / 60; assert(terrain_blend(k) == k);
+    last_kart_dt = 1.f / 30; assert(terrain_blend(k) == k);
+    last_kart_dt = 0; assert(terrain_blend(k) == k);
+    float at60 = old, at240 = old;
+    for (int i = 0; i < 6; ++i) { last_kart_dt = 1.f / 60; const float q = terrain_blend(k); at60 = at60 * q + target * (1 - q); }
+    for (int i = 0; i < 24; ++i) { last_kart_dt = 1.f / 240; const float q = terrain_blend(k); at240 = at240 * q + target * (1 - q); }
+    assert(fabsf(at60 - at240) < .01f);
+    last_kart_dt = 1.f / 240; assert(fabsf(terrain_blend(k) - powf(k, .25f)) < 1e-6f);
+    assert(terrain_blend(0) == 0 && terrain_blend(1) == 1);
+}
 static void test_high_fps_overspeed(void) {
     unsigned char kart[0x280]={0}, data[0x30]={0};
     const float multiplier=.5f, base=200; /* off-road: top speed 100 */
@@ -1405,6 +1419,7 @@ int main(void) {
     manager = &default_race_ptr;
     test_ai_physics();
     test_high_fps_overspeed();
+    test_high_fps_terrain_blend();
     manager = &default_race_ptr;
     test_reserves();
     manager = &default_race_ptr;
