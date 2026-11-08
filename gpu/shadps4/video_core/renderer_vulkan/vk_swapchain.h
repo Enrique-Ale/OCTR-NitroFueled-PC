@@ -71,6 +71,10 @@ public:
         return image_count;
     }
 
+    vk::PresentModeKHR GetPresentMode() const {
+        return present_mode;
+    }
+
     u32 GetFrameIndex() const {
         return frame_index;
     }

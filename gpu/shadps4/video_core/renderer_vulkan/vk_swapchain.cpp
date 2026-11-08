@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -252,6 +253,17 @@ void Swapchain::SetSurfaceProperties() {
 
     // Select number of images in swap chain, we prefer one buffer in the background to work on
     image_count = capabilities.minImageCount + 1;
+    // bbport: BB_PRESENT_IMAGES=<n> (lab) asks for n swapchain images, and so n presenter frames:
+    // with the native renderer the flip waits for a free frame (Presenter::GetRenderFrame), so a
+    // third or fourth one may let a fast GPU run further ahead of the display.
+    static const u32 wanted_images = [] {
+        const char* env = std::getenv("BB_PRESENT_IMAGES");
+        const int n = env ? std::atoi(env) : 0;
+        return n > 0 ? u32(std::min(n, 8)) : 0u;
+    }();
+    if (wanted_images) {
+        image_count = std::max(wanted_images, capabilities.minImageCount);
+    }
     if (capabilities.maxImageCount > 0) {
         image_count = std::min(image_count, capabilities.maxImageCount);
     }
