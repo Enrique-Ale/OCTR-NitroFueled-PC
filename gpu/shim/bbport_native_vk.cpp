@@ -2213,6 +2213,12 @@ std::vector<PipelineDesc> known;                  // every description this run 
 std::unordered_set<u64> known_keys;
 bool known_dirty = false;
 std::atomic<u64> compiles_done{0}, compile_ns{0}, preloaded{0}, skipped_compiling{0};
+/// BB_VK_PIPELINE_WAIT_MS=<n>: a draw whose pipeline is still compiling waits up to n ms for it
+/// (at most 4n ms in a second) instead of being left out (0, the default: left out at once).
+/// A first run then shows fewer missing objects for a frame, for a short hitch instead.
+u32 pipeline_wait_ms = 0;
+std::condition_variable compiled_cv; // with compile_mutex: a compile finished
+std::atomic<u64> waited_pipelines{0}, pipeline_wait_ns{0};
 
 void CompileThread() {
     BbCpu::Register("bb:NativeCompile");
@@ -2235,8 +2241,11 @@ void CompileThread() {
                                      .count()),
                              std::memory_order_relaxed);
         compiles_done.fetch_add(1, std::memory_order_relaxed);
-        std::lock_guard lk(compile_mutex);
-        compiled.emplace_back(job->key, pipeline);
+        {
+            std::lock_guard lk(compile_mutex);
+            compiled.emplace_back(job->key, pipeline);
+        }
+        compiled_cv.notify_all();
     }
 }
 
@@ -2321,6 +2330,40 @@ void Hurry(u64 key) {
         compile_queue.erase(it);
         compile_queue.push_front(std::move(job));
     }
+}
+
+/// BB_VK_PIPELINE_WAIT_MS: waits for the compile of `key`, within the budget, then takes the
+/// finished compiles (holding `mutex`; the compile threads never take it). True when it is done.
+bool WaitForCompile(u64 key) {
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point window = Clock::now();
+    static u64 spent_ns = 0; // in the current second
+    const auto now = Clock::now();
+    if (now - window >= std::chrono::seconds(1)) {
+        window = now;
+        spent_ns = 0;
+    }
+    const u64 budget_ns = u64(pipeline_wait_ms) * 4'000'000ull;
+    if (spent_ns >= budget_ns) {
+        return false;
+    }
+    const u64 wait_ns = std::min<u64>(u64(pipeline_wait_ms) * 1'000'000ull, budget_ns - spent_ns);
+    bool done = false;
+    {
+        std::unique_lock lk(compile_mutex);
+        done = compiled_cv.wait_for(lk, std::chrono::nanoseconds(wait_ns), [key] {
+            return std::any_of(compiled.begin(), compiled.end(),
+                               [key](const auto& c) { return c.first == key; });
+        });
+    }
+    const u64 took = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - now).count());
+    spent_ns += took;
+    pipeline_wait_ns.fetch_add(took, std::memory_order_relaxed);
+    if (done) {
+        waited_pipelines.fetch_add(1, std::memory_order_relaxed);
+        TakeCompiled();
+    }
+    return done;
 }
 
 /// Records the description of a pipeline seen for the first time (holding `mutex`).
@@ -3044,8 +3087,12 @@ void Draw(u64 ctx, u64 dev, u64 vsh, ShaderInfo& vs, u64 psh, ShaderInfo* ps, u6
     }
     if (!pipeline && compiling.count(key)) {
         Hurry(key);
-        skipped_compiling.fetch_add(1, std::memory_order_relaxed);
-        return;
+        if (pipeline_wait_ms && WaitForCompile(key)) {
+            pipeline = pipelines[key];
+        } else {
+            skipped_compiling.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
     }
     if (!pipeline) {
         skipped_pipeline.fetch_add(1, std::memory_order_relaxed);
@@ -4165,6 +4212,12 @@ void StartTextures() {
             std::printf("Native Vulkan: feedback loops %s\n", feedback_loops ? "on" : "off");
             const char* sp = std::getenv("BB_VK_SYNC_PIPELINES");
             async_pipelines = !(sp && sp[0] == '1');
+            if (const char* pw = std::getenv("BB_VK_PIPELINE_WAIT_MS"); pw && std::atoi(pw) > 0) {
+                pipeline_wait_ms = u32(std::min(std::atoi(pw), 100));
+                std::printf("Native Vulkan: a draw waits up to %u ms for its pipeline (%u ms a "
+                            "second at most)\n",
+                            pipeline_wait_ms, pipeline_wait_ms * 4);
+            }
             if (drawing) {
                 StartRecorder();
                 Geo::Init(*inst, Geo::Host{GeoSerial, GeoUpload, GeoFree});
@@ -4392,10 +4445,12 @@ void Report() {
                 }
                 const u64 done = compiles_done.load();
                 std::printf("Native Vulkan: pipelines: %llu compiled (%.0f ms each, %llu from the "
-                            "last run), %zu waiting; %llu draws left out while compiling\n",
+                            "last run), %zu waiting; %llu draws left out while compiling, %llu "
+                            "waited for their pipeline (%.0f ms in all)\n",
                             (unsigned long long)done, done ? compile_ns.load() / 1e6 / done : 0.0,
                             (unsigned long long)preloaded.load(), queued,
-                            (unsigned long long)skipped_compiling.load());
+                            (unsigned long long)skipped_compiling.load(),
+                            (unsigned long long)waited_pipelines.load(), pipeline_wait_ns.load() / 1e6);
             }
             std::vector<Gpu::WorkTime> work;
             {
