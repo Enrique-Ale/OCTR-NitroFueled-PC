@@ -108,9 +108,12 @@ the game's thread 62 ms, while the presenter's swap thread (`bb:Present`) took 9
     Presenter: per second: 326.8 presents (Mailbox, 3 images); acquire .. ms, record .. ms,
     submit .. ms, driver present .. ms; flips waited .. ms for a free frame (../s)
 
-Compare `Presentation` Mailbox and Immediate and `BB_PRESENT_IMAGES=4` with it before changing
-code there. The ideas below lower GPU time, which matters on the 680M and the Steam Deck, not
-for frame rate on such a PC.
+On that PC the line read `326.0 presents (Mailbox, 4 images); acquire 1 ms, record 4 ms,
+submit 9 ms, driver present 922 ms`: the driver's `vkQueuePresentKHR` blocks about 2.8 ms each
+time, so the frame rate is the display's pacing (a 360 Hz monitor with the NVIDIA driver's
+G-Sync/low latency cap comes to about 326), not the renderer. 3 or 4 images made no difference.
+The ideas below lower GPU time, which matters on the 680M and the Steam Deck, not for frame rate
+on such a PC.
 
 ## Ideas not done yet
 
