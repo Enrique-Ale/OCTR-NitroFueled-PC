@@ -39,7 +39,7 @@ Each run writes its log with the renderer's statistics every 5 seconds and, with
 | `BB_VK_DECODE_DRAWS=1` | Alone mode: shadPS4 decodes the draw state and draws again (by default it passes over them) |
 | `BB_FRAMES_AHEAD=N` | shadPS4's: how many frames its recording thread may run ahead of the GPU at a flip (1). Only without `BB_VK_NATIVE_ONLY`: in the launcher's mode the flip prepares its frame itself (`Presenter::PrepareNativeFrame`) and the bound is the presenter's frames instead (`BB_PRESENT_IMAGES`) |
 | `BB_PRESENT_IMAGES=N` | Swapchain images, and so presenter frames, asked for (the driver's minimum + 1, 3 on NVIDIA). A flip waits for a free frame; the `Presenter:` log line says how long |
-| `BB_VK_PIPELINE_WAIT_MS=N` | A draw whose pipeline is still compiling waits up to N ms for it, at most 4N ms a second (0, the default: it is left out). Fewer missing objects on a first run, for short hitches |
+| `BB_VK_PIPELINE_WAIT_MS=N` | A draw whose shaders are still loading or whose pipeline is still compiling waits up to N ms for them, at most 4N ms a second (10 by default; 0: it is left out at once). Fewer missing objects on a first run: on an RTX 5080 the waits took about 1 ms each and caused no hitch |
 | `BB_VK_RECORD_THREAD`, `BB_VK_SYNC_PIPELINES=1`, `BB_VK_DEFER_COPIES=0`, `BB_VK_VERTEX_COPY=0`, `BB_VK_FULL_BARRIERS`, `BB_VK_RESIDENT`, `BB_VK_TEXTURE_MB`, `BB_VK_NATIVE_SHADERS`, `BB_VK_DRAW` | Comparison and debugging switches; see `gpu/shim/bbport_native_vk.cpp` |
 
 ## How it works
@@ -129,7 +129,7 @@ on such a PC.
    for a free presenter frame and its fence (`Presenter::GetRenderFrame`), now logged as "flips
    waited"; `BB_FRAMES_AHEAD` does not apply there (see Switches). Also check submission
    boundaries, pipeline-not-ready skips (`draws left out while compiling`; the known pipelines are
-   preloaded from the last run, and `BB_VK_PIPELINE_WAIT_MS` waits for new ones) and waits on
+   preloaded from the last run, and a draw waits a little for new ones, `BB_VK_PIPELINE_WAIT_MS`) and waits on
    texture uploads (`waited for their upload`).
 3. **Shared power budget**: the 6800U shares power between CPU and GPU, and the renderer's extra
    threads may lower GPU clocks. Compare GPU clocks against stock shadPS4 in a race.

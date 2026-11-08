@@ -2213,12 +2213,13 @@ std::vector<PipelineDesc> known;                  // every description this run 
 std::unordered_set<u64> known_keys;
 bool known_dirty = false;
 std::atomic<u64> compiles_done{0}, compile_ns{0}, preloaded{0}, skipped_compiling{0};
-/// BB_VK_PIPELINE_WAIT_MS=<n>: a draw whose pipeline is still compiling waits up to n ms for it
-/// (at most 4n ms in a second) instead of being left out (0, the default: left out at once).
-/// A first run then shows fewer missing objects for a frame, for a short hitch instead.
-u32 pipeline_wait_ms = 0;
+/// BB_VK_PIPELINE_WAIT_MS=<n>: a draw whose shaders are still loading or whose pipeline is still
+/// compiling waits up to n ms for them (at most 4n ms in a second) instead of being left out
+/// (10 by default; 0: left out at once). On an RTX 5080 a first run's waits took about 1 ms each
+/// (275 draws, 278 ms in all) and caused none of its hitches.
+u32 pipeline_wait_ms = 10;
 std::condition_variable compiled_cv; // with compile_mutex: a compile finished
-std::atomic<u64> waited_pipelines{0}, pipeline_wait_ns{0};
+std::atomic<u64> waited_pipelines{0}, waited_modules{0}, pipeline_wait_ns{0};
 
 void CompileThread() {
     BbCpu::Register("bb:NativeCompile");
@@ -2232,6 +2233,8 @@ void CompileThread() {
         }
         if (job->module) {
             LoadModule(*job->module);
+            { std::lock_guard lk(compile_mutex); } // a waiter checks load_done under it
+            compiled_cv.notify_all();
             continue;
         }
         const auto t0 = std::chrono::steady_clock::now();
@@ -2332,12 +2335,16 @@ void Hurry(u64 key) {
     }
 }
 
-/// BB_VK_PIPELINE_WAIT_MS: waits for the compile of `key`, within the budget, then takes the
-/// finished compiles (holding `mutex`; the compile threads never take it). True when it is done.
-bool WaitForCompile(u64 key) {
+/// BB_VK_PIPELINE_WAIT_MS: waits until `done()` (checked under compile_mutex), within the
+/// budget: n ms for one draw, 4n ms in a second (holding `mutex`; the compile threads never take
+/// it). True when it came true.
+std::chrono::steady_clock::time_point wait_window{}; // the budget's current second
+u64 wait_spent_ns = 0;                                // spent in it
+template <typename Done>
+bool WaitWithinBudget(Done done) {
     using Clock = std::chrono::steady_clock;
-    static Clock::time_point window = Clock::now();
-    static u64 spent_ns = 0; // in the current second
+    auto& window = wait_window;
+    auto& spent_ns = wait_spent_ns;
     const auto now = Clock::now();
     if (now - window >= std::chrono::seconds(1)) {
         window = now;
@@ -2348,20 +2355,37 @@ bool WaitForCompile(u64 key) {
         return false;
     }
     const u64 wait_ns = std::min<u64>(u64(pipeline_wait_ms) * 1'000'000ull, budget_ns - spent_ns);
-    bool done = false;
+    bool ok = false;
     {
         std::unique_lock lk(compile_mutex);
-        done = compiled_cv.wait_for(lk, std::chrono::nanoseconds(wait_ns), [key] {
-            return std::any_of(compiled.begin(), compiled.end(),
-                               [key](const auto& c) { return c.first == key; });
-        });
+        ok = compiled_cv.wait_for(lk, std::chrono::nanoseconds(wait_ns), done);
     }
     const u64 took = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - now).count());
     spent_ns += took;
     pipeline_wait_ns.fetch_add(took, std::memory_order_relaxed);
+    return ok;
+}
+
+/// Waits for the compile of `key` within the budget, then takes the finished compiles (holding
+/// `mutex`). True when it is done.
+bool WaitForCompile(u64 key) {
+    const bool done = WaitWithinBudget([key] {
+        return std::any_of(compiled.begin(), compiled.end(),
+                           [key](const auto& c) { return c.first == key; });
+    });
     if (done) {
         waited_pipelines.fetch_add(1, std::memory_order_relaxed);
         TakeCompiled();
+    }
+    return done;
+}
+
+/// Waits for the loads of a draw's shader modules (queued by ModuleReady) within the budget.
+bool WaitForModules(ShaderInfo* vs, ShaderInfo* ps, ShaderInfo* gs) {
+    const auto loaded = [](ShaderInfo* s) { return !s || s->load_done.load(std::memory_order_acquire); };
+    const bool done = WaitWithinBudget([&] { return loaded(vs) && loaded(ps) && loaded(gs); });
+    if (done) {
+        waited_modules.fetch_add(1, std::memory_order_relaxed);
     }
     return done;
 }
@@ -4212,8 +4236,10 @@ void StartTextures() {
             std::printf("Native Vulkan: feedback loops %s\n", feedback_loops ? "on" : "off");
             const char* sp = std::getenv("BB_VK_SYNC_PIPELINES");
             async_pipelines = !(sp && sp[0] == '1');
-            if (const char* pw = std::getenv("BB_VK_PIPELINE_WAIT_MS"); pw && std::atoi(pw) > 0) {
-                pipeline_wait_ms = u32(std::min(std::atoi(pw), 100));
+            if (const char* pw = std::getenv("BB_VK_PIPELINE_WAIT_MS"); pw && *pw) {
+                pipeline_wait_ms = u32(std::clamp(std::atoi(pw), 0, 100));
+            }
+            if (pipeline_wait_ms) {
                 std::printf("Native Vulkan: a draw waits up to %u ms for its pipeline (%u ms a "
                             "second at most)\n",
                             pipeline_wait_ms, pipeline_wait_ms * 4);
@@ -4446,11 +4472,12 @@ void Report() {
                 const u64 done = compiles_done.load();
                 std::printf("Native Vulkan: pipelines: %llu compiled (%.0f ms each, %llu from the "
                             "last run), %zu waiting; %llu draws left out while compiling, %llu "
-                            "waited for their pipeline (%.0f ms in all)\n",
+                            "waited for their pipeline and %llu for their shaders (%.0f ms in all)\n",
                             (unsigned long long)done, done ? compile_ns.load() / 1e6 / done : 0.0,
                             (unsigned long long)preloaded.load(), queued,
                             (unsigned long long)skipped_compiling.load(),
-                            (unsigned long long)waited_pipelines.load(), pipeline_wait_ns.load() / 1e6);
+                            (unsigned long long)waited_pipelines.load(),
+                            (unsigned long long)waited_modules.load(), pipeline_wait_ns.load() / 1e6);
             }
             std::vector<Gpu::WorkTime> work;
             {
@@ -4589,7 +4616,7 @@ void DrawFrom(u64 ctx, u64 dev, bool indexed, u32 count, u64 index_addr) {
     if (gs) {
         ready &= ModuleReady(*gs);
     }
-    if (!ready) {
+    if (!ready && !(pipeline_wait_ms && WaitForModules(vs, ps, gs))) {
         skipped_compiling.fetch_add(1, std::memory_order_relaxed);
         return;
     }
