@@ -36,9 +36,11 @@
 #include "bbport_native_vk_geometry.h"
 #include "bbport_pm4_census.h"
 #include "bbport_thread_cpu.h"
+#include "bbport_native_vk_dlss.h"
 #include "bbport_native_vk_gpu.h"
 #include "bbport_native_vk_spirv.h"
 #include "bbport_native_vk_texture.h"
+#include "video_core/renderer_vulkan/vk_frame_capture.h"
 
 #include "video_core/renderer_vulkan/bb_hud_scale.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -862,6 +864,7 @@ struct DrawPacket {
     bool writes_depth = false; // depth or stencil written (else the attachment is only read)
     bool writes_z = false;     // depth values written (writes_depth without it: stencil only)
     const Target* twin = nullptr; // a depth copy's destination, sampled as the depth target instead
+    const struct UpscaleJob* upscale = nullptr; // the display pass's first draw: DLSS first
     Ref ib;
     vk::IndexType ib_type = vk::IndexType::eUint32;
     u32 count = 0;
@@ -1006,6 +1009,10 @@ std::vector<CopyPacket> pending_copies; // recorder side; at most one per destin
 std::atomic<u64> copies_dropped{0}, copies_swapped{0}, copies_in_place{0}, copies_twinned{0}, stale_reads{0};
 void BeforeRead(const Gpu::Image* img);
 void ReportTemporalInputs(double seconds);
+struct DrawPacket;
+struct Target;
+void NativeTemporal(u64 ctx, DrawPacket& d, Target* const colors[8], Target* depth, u32 count);
+void UpscaleForDisplay(DrawPacket& d);
 void BeforeWrite(const Gpu::Image* img);
 void BeforeStencilWrite(const Gpu::Image* img);
 void ReadInPlace(DrawPacket& d);
@@ -3294,6 +3301,7 @@ void Draw(u64 ctx, u64 dev, u64 vsh, ShaderInfo& vs, u64 psh, ShaderInfo* ps, u6
     }
     d.layout = layout;
     d.pipeline = pipeline;
+    NativeTemporal(ctx, d, colors, depth_target, count);
     lap(SecPacket);
 }
 
@@ -3400,6 +3408,10 @@ void RecordDraw(DrawPacket& d) {
             Gpu::Trace("  %s read as the depth target (copy not made)\n",
                        Gpu::Describe(&d.twin->img).c_str());
         }
+    }
+    // DLSS before the ring is used (a new DLSS feature submits what was recorded)
+    if (d.upscale) {
+        UpscaleForDisplay(d);
     }
     if (!pending_copies.empty()) {
         for (const StageRes* res : {&d.res[0], &d.res[1]}) {
@@ -4219,6 +4231,9 @@ void StartTextures() {
                       Gpu::Init(*inst, shader_root.empty()
                                            ? std::string()
                                            : (shader_root / "pipeline_cache.bin").string());
+            if (drawing) {
+                Dlss::Init(*inst);
+            }
             const char* sh = std::getenv("BB_VK_SHOW");
             show = drawing && sh && sh[0] == '1';
             const char* al = std::getenv("BB_VK_ALONE");
@@ -4741,6 +4756,21 @@ struct ReprojectVotes {
 };
 ReprojectVotes reproject_votes; // capture thread only
 
+/// DLSS (capture thread): what this frame's G-buffer passes gave so far.
+struct SceneFrame {
+    Target* depth = nullptr;
+    Target* velocity = nullptr;
+    bool camera = false;
+    Mat4f reproject{}, projection{};
+    vk::Viewport viewport{}; // of a G-buffer draw, without the jitter
+    bool has_viewport = false;
+};
+SceneFrame scene_frame;
+Target* jitter_depth = nullptr;      // the last frame's scene depth: draws into it are jittered
+std::array<float, 2> scene_jitter{}; // by this much (pixels), this frame
+Target* last_color = nullptr;        // the last draw's first color target (not a display buffer)
+bool last_display = false;           // the last draw was into a display buffer
+
 bool LooksLikeProjection(const float* m) {
     return std::abs(std::abs(m[11]) - 1.0f) < 1e-4f && std::abs(m[15]) < 1e-6f && m[0] > 0.05f &&
            m[0] < 20.0f && m[5] > 0.05f && m[5] < 20.0f && std::abs(m[1]) < 1e-4f &&
@@ -4761,6 +4791,11 @@ void ProbeTemporalInputs(u64 ctx, Target* const colors[8], Target* depth) {
             std::memmove(r, r + 1, sizeof(r) - sizeof(r[0]));
             r[3] = t.pass_draws;
             const auto& best = reproject_votes.Best();
+            if (best.votes >= 4) {
+                scene_frame.camera = true;
+                scene_frame.reproject = best.m;
+                scene_frame.projection = reproject_votes.projection;
+            }
             if (best.votes) {
                 temporal_log.reproject = best.m;
                 temporal_log.projection = reproject_votes.projection;
@@ -4778,6 +4813,8 @@ void ProbeTemporalInputs(u64 ctx, Target* const colors[8], Target* depth) {
         t.pass_draws = 0;
         t.depth = depth;
         t.velocity = colors[3];
+        scene_frame.depth = depth;
+        scene_frame.velocity = colors[3];
         TemporalLog log;
         log.depth_w = depth->img.width;
         log.depth_h = depth->img.height;
@@ -4853,6 +4890,214 @@ void ProbeTemporalInputs(u64 ctx, Target* const colors[8], Target* depth) {
     }
 }
 
+/// What DLSS gets for a frame, made at the display pass's first draw (capture thread) and read
+/// when that draw is recorded (a ring: the recorder is at most a few frames behind).
+struct UpscaleJob {
+    Target* source = nullptr; // the finished scene the display pass samples
+    Target* depth = nullptr;
+    Target* velocity = nullptr;
+    Mat4f reproject{}, projection{};
+    bool camera = false;
+    float xscale = 0, yscale = 0, xoffset = 0, yoffset = 0, zscale = 0, zoffset = 0;
+    std::array<float, 2> jitter{};
+    bool reset = false;
+    u32 out_w = 0, out_h = 0;
+};
+std::array<UpscaleJob, 16> upscale_jobs;
+u32 upscale_job_next = 0;
+std::atomic<u64> upscale_frames{0}, upscale_done{0}, upscale_no_scene{0};
+
+/// Capture thread, for each draw: scene draws are jittered for DLSS, and the display pass's
+/// first draw (the frame's end, before the HUD) takes this frame's inputs.
+void NativeTemporal(u64 ctx, DrawPacket& d, Target* const colors[8], Target* depth, u32 count) {
+    if (!Dlss::Wanted()) {
+        last_display = false;
+        return;
+    }
+    if (depth && depth == scene_frame.depth && colors[3] && colors[3] == scene_frame.velocity &&
+        !scene_frame.has_viewport) {
+        scene_frame.viewport = d.viewport;
+        scene_frame.has_viewport = true;
+    }
+    // draws into the scene depth but full-screen passes (a quad: the edge column would be left)
+    if (depth && depth == jitter_depth && count > 6) {
+        d.viewport.x += scene_jitter[0];
+        d.viewport.y += scene_jitter[1];
+    }
+    u64 base = 0;
+    if (const u64 h = Q(ctx + CtxColorTargets)) {
+        base = u64(R<u32>(h + 0x10)) << 8;
+    }
+    const bool display = base && colors[0] && Vulkan::FrameCapture::IsDisplayBuffer(base);
+    const bool start = display && !last_display;
+    last_display = display;
+    if (!display) {
+        last_color = colors[0];
+        return;
+    }
+    if (!start) {
+        return;
+    }
+    upscale_frames.fetch_add(1, std::memory_order_relaxed);
+    bool sampled = false;
+    for (const Slot& slot : d.res[1].slots) {
+        sampled |= last_color && slot.target == last_color;
+    }
+    const SceneFrame& sf = scene_frame;
+    if (sampled && sf.depth && sf.velocity && sf.has_viewport) {
+        UpscaleJob& j = upscale_jobs[upscale_job_next++ % upscale_jobs.size()];
+        j = {};
+        j.source = last_color;
+        j.depth = sf.depth;
+        j.velocity = sf.velocity;
+        j.camera = sf.camera;
+        j.reproject = sf.reproject;
+        j.projection = sf.projection;
+        const vk::Viewport& vp = sf.viewport;
+        j.xscale = vp.width * 0.5f;
+        j.yscale = vp.height * 0.5f; // negative: y flipped as drawn
+        j.xoffset = vp.x + vp.width * 0.5f;
+        j.yoffset = vp.y + vp.height * 0.5f;
+        // OpenGL-style clip depth (-1..1; the projection's [14] is -2fn/(f-n))
+        j.zscale = (vp.maxDepth - vp.minDepth) * 0.5f;
+        j.zoffset = (vp.maxDepth + vp.minDepth) * 0.5f;
+        const bool jittered = jitter_depth == sf.depth;
+        j.jitter = jittered ? scene_jitter : std::array<float, 2>{};
+        j.reset = !jittered;
+        j.out_w = colors[0]->img.width;
+        j.out_h = colors[0]->img.height;
+        d.upscale = &j;
+    } else {
+        upscale_no_scene.fetch_add(1, std::memory_order_relaxed);
+    }
+    jitter_depth = sf.depth;
+    scene_jitter = Dlss::NextJitter();
+    scene_frame = {};
+}
+
+/// The image DLSS writes (recorder thread): a target of its own, sampled by the display pass
+/// in place of the scene.
+std::unique_ptr<Target> dlss_output;
+
+Target* DlssOutput(u32 w, u32 h, vk::Format format, u32 comp_swap) {
+    if (dlss_output && dlss_output->img.width == w && dlss_output->img.height == h &&
+        dlss_output->img.format == format) {
+        return dlss_output.get();
+    }
+    const Vulkan::Instance* inst = instance.load();
+    if (!inst) {
+        return nullptr;
+    }
+    if (dlss_output) {
+        DestroyTarget(*inst, *dlss_output);
+        dlss_output.reset();
+    }
+    using U = vk::ImageUsageFlagBits;
+    const vk::ImageCreateInfo ici{
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {w, h, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = U::eStorage | U::eSampled | U::eTransferSrc | U::eTransferDst,
+        .sharingMode = vk::SharingMode::eExclusive,
+        .initialLayout = vk::ImageLayout::eUndefined,
+    };
+    VmaAllocationCreateInfo aci{};
+    aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    aci.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation allocation = nullptr;
+    const VkImageCreateInfo& raw = ici;
+    if (vmaCreateImage(inst->GetAllocator(), &raw, &aci, &image, &allocation, nullptr) !=
+        VK_SUCCESS) {
+        std::printf("Native Vulkan: DLSS: its %ux%u output could not be made\n", w, h);
+        return nullptr;
+    }
+    auto view_of = [&](vk::ImageViewType type) {
+        auto [vr, view] = inst->GetDevice().createImageView({
+            .image = image,
+            .viewType = type,
+            .format = format,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        });
+        return vr == vk::Result::eSuccess ? VkImageView(view) : VK_NULL_HANDLE;
+    };
+    dlss_output = std::make_unique<Target>();
+    Target& t = *dlss_output;
+    t.img.image = image;
+    t.allocation = allocation;
+    t.view = view_of(vk::ImageViewType::e2D);
+    t.view_array = view_of(vk::ImageViewType::e2DArray);
+    t.img.attach = t.view;
+    t.img.width = w;
+    t.img.height = h;
+    t.img.format = format;
+    t.img.layout = vk::ImageLayout::eUndefined;
+    t.comp_swap = comp_swap;
+    t.bytes = u64(w) * h * 4;
+    target_bytes.fetch_add(t.bytes, std::memory_order_relaxed);
+    if (!t.view || !t.view_array) {
+        DestroyTarget(*inst, t);
+        dlss_output.reset();
+        return nullptr;
+    }
+    return &t;
+}
+
+/// Recorder thread: DLSS before the display pass's first draw, which then samples its output.
+void UpscaleForDisplay(DrawPacket& d) {
+    const UpscaleJob& j = *d.upscale;
+    Target* const src = j.source;
+    if (!src || !j.depth || !j.velocity ||
+        (src->img.format != vk::Format::eR8G8B8A8Unorm &&
+         src->img.format != vk::Format::eB8G8R8A8Unorm)) {
+        return;
+    }
+    Target* const out = DlssOutput(j.out_w, j.out_h, src->img.format, src->comp_swap);
+    if (!out) {
+        return;
+    }
+    if (!pending_copies.empty()) { // copies into what DLSS reads are made first
+        BeforeRead(&src->img);
+        BeforeRead(&j.depth->img);
+        BeforeRead(&j.velocity->img);
+    }
+    Dlss::Frame f;
+    f.color = &src->img;
+    f.color_view = src->view;
+    f.depth = &j.depth->img;
+    f.depth_view = j.depth->view; // the depth aspect
+    f.velocity = &j.velocity->img;
+    f.velocity_view = j.velocity->view;
+    f.reproject = j.reproject;
+    f.projection = j.projection;
+    f.camera = j.camera;
+    f.xscale = j.xscale;
+    f.yscale = j.yscale;
+    f.xoffset = j.xoffset;
+    f.yoffset = j.yoffset;
+    f.zscale = j.zscale;
+    f.zoffset = j.zoffset;
+    f.jitter = j.jitter;
+    f.reset = j.reset;
+    f.output = &out->img;
+    f.output_view = out->view;
+    if (!Dlss::Upscale(f)) {
+        return;
+    }
+    upscale_done.fetch_add(1, std::memory_order_relaxed);
+    for (StageRes& res : d.res) {
+        for (Slot& slot : res.slots) {
+            if (slot.target == src) {
+                slot.target = out;
+            }
+        }
+    }
+}
+
 /// One line every 5 seconds.
 void ReportTemporalInputs(double seconds) {
     const u64 passes = gbuffer_passes.exchange(0), cams = gbuffer_cameras.exchange(0);
@@ -4860,6 +5105,12 @@ void ReportTemporalInputs(double seconds) {
     {
         std::lock_guard lk(temporal_log_mutex);
         t = temporal_log;
+    }
+    if (Dlss::Wanted()) {
+        const u64 frames = upscale_frames.exchange(0), done = upscale_done.exchange(0),
+                  no_scene = upscale_no_scene.exchange(0);
+        std::printf("Native Vulkan: DLSS: %.1f frames/s, %.1f upscaled, %.1f without a scene\n",
+                    frames / seconds, done / seconds, no_scene / seconds);
     }
     if (!passes) {
         std::printf("Native Vulkan: temporal inputs: no G-buffer pass\n");
