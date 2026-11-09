@@ -31,6 +31,7 @@ bool Wanted();
 struct Frame {
     Gpu::Image* color = nullptr;   // the finished scene (render size)
     VkImageView color_view = VK_NULL_HANDLE;
+    bool hdr = false;              // the scene is linear HDR colour (the game's HDR output)
     Gpu::Image* depth = nullptr;   // the scene depth
     VkImageView depth_view = VK_NULL_HANDLE; // its depth aspect
     Gpu::Image* velocity = nullptr; // CTR's velocity target (G-buffer color 3)

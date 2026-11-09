@@ -4909,6 +4909,12 @@ void ProbeTemporalInputs(u64 ctx, Target* const colors[8], Target* depth) {
     }
 }
 
+/// The scene images DLSS takes: 8-bit colour, or the 16-bit float scene of the game's HDR output.
+bool DlssSource(vk::Format format) {
+    return format == vk::Format::eR8G8B8A8Unorm || format == vk::Format::eB8G8R8A8Unorm ||
+           format == vk::Format::eR16G16B16A16Sfloat;
+}
+
 /// What DLSS gets for a frame, made at the display pass's first draw (capture thread) and read
 /// when that draw is recorded (a ring: the recorder is at most a few frames behind).
 struct UpscaleJob {
@@ -4970,7 +4976,7 @@ void NativeTemporal(u64 ctx, DrawPacket& d, Target* const colors[8], Target* dep
         sampled |= last_color && slot.target == last_color;
     }
     const SceneFrame& sf = scene_frame;
-    if (sampled && sf.depth && sf.velocity && sf.has_viewport) {
+    if (sampled && sf.depth && sf.velocity && sf.has_viewport && DlssSource(last_color->img.format)) {
         UpscaleJob& j = upscale_jobs[upscale_job_next++ % upscale_jobs.size()];
         j = {};
         j.source = last_color;
@@ -4996,7 +5002,8 @@ void NativeTemporal(u64 ctx, DrawPacket& d, Target* const colors[8], Target* dep
     } else {
         upscale_no_scene.fetch_add(1, std::memory_order_relaxed);
     }
-    jitter_depth = sf.depth;
+    // only a frame DLSS takes is jittered: its jitter is taken off again
+    jitter_depth = d.upscale ? sf.depth : nullptr;
     jitter_color = d.upscale ? last_color : nullptr;
     scene_jitter = Dlss::NextJitter();
     scene_frame = {};
@@ -5078,9 +5085,7 @@ Target* DlssOutput(u32 w, u32 h, vk::Format format, u32 comp_swap) {
 void UpscaleForDisplay(DrawPacket& d) {
     const UpscaleJob& j = *d.upscale;
     Target* const src = j.source;
-    if (!src || !j.depth || !j.velocity ||
-        (src->img.format != vk::Format::eR8G8B8A8Unorm &&
-         src->img.format != vk::Format::eB8G8R8A8Unorm)) {
+    if (!src || !j.depth || !j.velocity || !DlssSource(src->img.format)) {
         return;
     }
     Target* const out = DlssOutput(j.out_w, j.out_h, src->img.format, src->comp_swap);
@@ -5095,6 +5100,7 @@ void UpscaleForDisplay(DrawPacket& d) {
     Dlss::Frame f;
     f.color = &src->img;
     f.color_view = src->view;
+    f.hdr = src->img.format == vk::Format::eR16G16B16A16Sfloat;
     f.depth = &j.depth->img;
     f.depth_view = j.depth->view; // the depth aspect
     f.velocity = &j.velocity->img;

@@ -1620,6 +1620,7 @@ void StartGame() {
     SetEnv(L"BB_GAMEPAD", a.launcher.Get("gamepad"));
     SetEnv(L"BB_MENU_LANGUAGE", g_spanish ? "es" : "en");  // the in-game menu follows the launcher
     SetEnv(L"BB_SAVE_LOG", a.launcher.Flag("save_log", false) ? "1" : "");
+    if (a.launcher.Flag("hdr", false)) SetEnv(L"BB_HDR", "1");  // off: BB_HDR as set outside
     SetEnv(L"BB_DLC", a.launcher.Flag("dlc", true) ? "1" : "0");
     SetEnv(L"BB_DLC_DISABLED", a.launcher.Get("dlc_disabled"));
     SetEnv(L"BB_FULLSCREEN", "");  // bbport.ini's fullscreen= (the menu switch) decides
@@ -3191,6 +3192,11 @@ void SettingsTab() {
                      "same resolution. DLSS needs an NVIDIA RTX card and FSR 4 a GPU with INT8 support and its files "
                      "(FSR 3 runs otherwise). Experimental: switch to FSR 1 if you see trails or shimmering."));
     }
+    LauncherFlag("hdr", T("HDR del juego", "The game's HDR"), false,
+                 T("La salida HDR propia del juego (HDR10). Activa también el HDR de Windows y apaga el "
+                   "RTX HDR para este juego. Experimental.",
+                   "The game's own HDR output (HDR10). Also turn on Windows HDR and turn off RTX HDR for "
+                   "this game. Experimental."));
     if (temporal == "dlss") {
         static constexpr Choice kQuality[] = {
             {"Automática (resolución interna)", "Auto (internal resolution)", "auto"},

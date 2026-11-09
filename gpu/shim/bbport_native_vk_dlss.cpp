@@ -233,6 +233,7 @@ bool Upscale(const Frame& f) {
                              : "sacredfire_dlss.dll or nvngx_dlss.dll is not next to the game");
             std::fflush(stdout);
         }
+        failed.store(true, std::memory_order_relaxed); // no jitter left on the scene either
         return false;
     }
     const u32 w = f.color->width, h = f.color->height;
@@ -260,7 +261,7 @@ bool Upscale(const Frame& f) {
     const u32 preset = preset_env ? u32(std::atoi(preset_env))
                        : BbSettings::Get().dlss_model == 1 ? 5u : 0u;
     const DlssNgx::FeatureDesc desc{w,      h,     ow,    oh, DlssNgx::QualityForScale(float(ow) / float(w)),
-                                    false, preset, false};
+                                    false, preset, f.hdr};
     bool reset = f.reset;
     if (!dlss->HasFeature(desc)) {
         // a feature made before goes first: the GPU must be done with it
@@ -273,8 +274,8 @@ bool Upscale(const Frame& f) {
         }
         Gpu::Invalidate();
         reset = true;
-        std::printf("Native Vulkan: DLSS: %ux%u -> %ux%u, quality %d, preset %u\n", w, h, ow, oh,
-                    desc.quality, preset);
+        std::printf("Native Vulkan: DLSS: %ux%u -> %ux%u, quality %d, preset %u%s\n", w, h, ow,
+                    oh, desc.quality, preset, f.hdr ? ", HDR (linear colour)" : "");
         std::fflush(stdout);
     }
 
