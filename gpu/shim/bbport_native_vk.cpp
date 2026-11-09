@@ -1005,6 +1005,7 @@ std::vector<const Gpu::Image*> stale_copies; // copy destinations a ReadInPlace 
 std::vector<CopyPacket> pending_copies; // recorder side; at most one per destination
 std::atomic<u64> copies_dropped{0}, copies_swapped{0}, copies_in_place{0}, copies_twinned{0}, stale_reads{0};
 void BeforeRead(const Gpu::Image* img);
+void ReportTemporalInputs(double seconds);
 void BeforeWrite(const Gpu::Image* img);
 void BeforeStencilWrite(const Gpu::Image* img);
 void ReadInPlace(DrawPacket& d);
@@ -4479,6 +4480,7 @@ void Report() {
                             (unsigned long long)waited_pipelines.load(),
                             (unsigned long long)waited_modules.load(), pipeline_wait_ns.load() / 1e6);
             }
+            ReportTemporalInputs(5.0);
             std::vector<Gpu::WorkTime> work;
             {
                 std::lock_guard g(gpu_mutex);
@@ -4591,6 +4593,102 @@ void Attach(const Vulkan::Instance& vulkan) {
 
 namespace {
 /// A draw from the engine context at `ctx` (the capture thread's copy, or the engine's own).
+// ------------------------------------------------------------------ temporal inputs
+/// What a temporal upscaler (DLSS, FSR 3) needs from a frame, as vk_ctr_fsr3 finds it in the
+/// shadPS4 renderer: CTR's G-buffer pass (four color targets and the scene depth) gives the
+/// scene depth, the velocity target the game writes for its motion blur (color 3) and the
+/// viewport; the first G-buffer draw's 528-byte vertex constants the camera (view, projection
+/// and the previous frame's view at floats 32, 48 and 64). Only logged for now (capture thread).
+struct TemporalInputs {
+    Target* depth = nullptr;    // capture thread only
+    Target* velocity = nullptr; // capture thread only
+    bool in_pass = false;       // the last draw was a G-buffer draw
+};
+TemporalInputs temporal_inputs;
+/// The last G-buffer pass as the report prints it (under temporal_log_mutex).
+struct TemporalLog {
+    u32 depth_w = 0, depth_h = 0, vel_w = 0, vel_h = 0;
+    vk::Format depth_format{}, vel_format{};
+    ViewportI viewport{};
+    std::array<float, 132> camera{};
+    bool camera_valid = false;
+};
+std::mutex temporal_log_mutex;
+TemporalLog temporal_log;
+std::atomic<u64> gbuffer_passes{0}, gbuffer_cameras{0};
+
+void ProbeTemporalInputs(u64 ctx, Target* const colors[8], Target* depth) {
+    TemporalInputs& t = temporal_inputs;
+    u32 n = 0;
+    for (int i = 0; i < 8; ++i) {
+        n += colors[i] != nullptr;
+    }
+    const bool gbuffer = n == 4 && colors[0] && colors[3] && depth && !colors[4];
+    if (!gbuffer) {
+        t.in_pass = false;
+        return;
+    }
+    if (t.in_pass) {
+        return; // the pass's first draw carries what is needed
+    }
+    t.in_pass = true;
+    t.depth = depth;
+    t.velocity = colors[3];
+    TemporalLog log;
+    log.depth_w = depth->img.width;
+    log.depth_h = depth->img.height;
+    log.depth_format = depth->img.format;
+    log.vel_w = colors[3]->img.width;
+    log.vel_h = colors[3]->img.height;
+    log.vel_format = colors[3]->img.format;
+    log.viewport = R<ViewportI>(ctx + CtxViewport);
+    if (const Capture* c = capturing) {
+        for (u32 k = 0; k < c->cb_count[0]; ++k) {
+            const Capture::Cb& cb = c->cbs[0][k];
+            if (cb.size == 528) {
+                std::memcpy(log.camera.data(), c->bytes.data() + cb.offset, 528);
+                log.camera_valid = log.camera[48] != 0.0f && log.camera[53] != 0.0f;
+                break;
+            }
+        }
+    }
+    gbuffer_passes.fetch_add(1, std::memory_order_relaxed);
+    gbuffer_cameras.fetch_add(log.camera_valid, std::memory_order_relaxed);
+    std::lock_guard lk(temporal_log_mutex);
+    temporal_log = log;
+}
+
+/// One line every 5 seconds.
+void ReportTemporalInputs(double seconds) {
+    const u64 passes = gbuffer_passes.exchange(0), cams = gbuffer_cameras.exchange(0);
+    TemporalLog t;
+    {
+        std::lock_guard lk(temporal_log_mutex);
+        t = temporal_log;
+    }
+    if (!passes) {
+        std::printf("Native Vulkan: temporal inputs: no G-buffer pass\n");
+        return;
+    }
+    float fov = 0, near_plane = 0, far_plane = 0;
+    if (t.camera_valid) {
+        const float* p = &t.camera[48];
+        const float a = p[10], b = p[14];
+        if (p[5] > 0.0f && a != 1.0f && a != -1.0f) {
+            fov = 2.0f * std::atan(1.0f / p[5]) * 57.29578f;
+            near_plane = std::abs(b / (a - 1.0f));
+            far_plane = std::abs(b / (a + 1.0f));
+        }
+    }
+    std::printf("Native Vulkan: temporal inputs: %.1f G-buffer passes/s, %.1f with the camera; "
+                "depth %ux%u %s, velocity %ux%u %s; viewport %d,%d %dx%d z %.2f-%.2f; camera fov "
+                "%.1f deg, near %.2f, far %.0f\n",
+                passes / seconds, cams / seconds, t.depth_w, t.depth_h,
+                vk::to_string(t.depth_format).c_str(), t.vel_w, t.vel_h,
+                vk::to_string(t.vel_format).c_str(), t.viewport.x, t.viewport.y, t.viewport.w,
+                t.viewport.h, t.viewport.zmin, t.viewport.zmax, fov, near_plane, far_plane);
+}
+
 void DrawFrom(u64 ctx, u64 dev, bool indexed, u32 count, u64 index_addr) {
     lap.Start();
     const u64 vsh = Q(ctx + CtxVs);
@@ -4638,6 +4736,7 @@ void DrawFrom(u64 ctx, u64 dev, bool indexed, u32 count, u64 index_addr) {
         return;
     }
     resolved.fetch_add(1, std::memory_order_relaxed);
+    ProbeTemporalInputs(ctx, colors, depth_target);
     if (drawing) {
         // with a GS, the ES runs as the vertex stage and its outputs feed the GS directly (the
         // ES -> GS ring of the PS4 becomes the pipeline's own interface, as in the D3D11 port)
