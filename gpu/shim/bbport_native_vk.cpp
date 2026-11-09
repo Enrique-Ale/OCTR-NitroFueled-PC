@@ -4785,6 +4785,7 @@ struct SceneFrame {
 };
 SceneFrame scene_frame;
 Target* jitter_depth = nullptr;      // the last frame's scene depth: draws into it are jittered
+Target* jitter_color = nullptr;      // and the scene image DLSS read, for draws without that depth
 std::array<float, 2> scene_jitter{}; // by this much (pixels), this frame
 Target* last_color = nullptr;        // the last draw's first color target (not a display buffer)
 bool last_display = false;           // the last draw was into a display buffer
@@ -4924,6 +4925,8 @@ struct UpscaleJob {
 std::array<UpscaleJob, 16> upscale_jobs;
 u32 upscale_job_next = 0;
 std::atomic<u64> upscale_frames{0}, upscale_done{0}, upscale_no_scene{0};
+// draws jittered by the scene depth, and by the scene image alone (no scene depth)
+std::atomic<u64> jittered_by_depth{0}, jittered_by_color{0};
 
 /// Capture thread, for each draw: scene draws are jittered for DLSS, and the display pass's
 /// first draw (the frame's end, before the HUD) takes this frame's inputs.
@@ -4937,8 +4940,13 @@ void NativeTemporal(u64 ctx, DrawPacket& d, Target* const colors[8], Target* dep
         scene_frame.viewport = d.viewport;
         scene_frame.has_viewport = true;
     }
-    // draws into the scene depth but full-screen passes (a quad: the edge column would be left)
-    if (depth && depth == jitter_depth && count > 6) {
+    // draws into the scene depth or the scene image (a background drawn without the depth, as
+    // at the character select, would shake otherwise: DLSS takes the jitter off every pixel),
+    // but full-screen passes (a quad: the edge column would be left)
+    if (((depth && depth == jitter_depth) || (colors[0] && colors[0] == jitter_color)) &&
+        count > 6) {
+        (depth && depth == jitter_depth ? jittered_by_depth : jittered_by_color)
+            .fetch_add(1, std::memory_order_relaxed);
         d.viewport.x += scene_jitter[0];
         d.viewport.y += scene_jitter[1];
     }
@@ -4989,6 +4997,7 @@ void NativeTemporal(u64 ctx, DrawPacket& d, Target* const colors[8], Target* dep
         upscale_no_scene.fetch_add(1, std::memory_order_relaxed);
     }
     jitter_depth = sf.depth;
+    jitter_color = d.upscale ? last_color : nullptr;
     scene_jitter = Dlss::NextJitter();
     scene_frame = {};
 }
@@ -5126,9 +5135,12 @@ void ReportTemporalInputs(double seconds) {
     }
     if (Dlss::Wanted()) {
         const u64 frames = upscale_frames.exchange(0), done = upscale_done.exchange(0),
-                  no_scene = upscale_no_scene.exchange(0);
-        std::printf("Native Vulkan: DLSS: %.1f frames/s, %.1f upscaled, %.1f without a scene\n",
-                    frames / seconds, done / seconds, no_scene / seconds);
+                  no_scene = upscale_no_scene.exchange(0), by_depth = jittered_by_depth.exchange(0),
+                  by_color = jittered_by_color.exchange(0);
+        std::printf("Native Vulkan: DLSS: %.1f frames/s, %.1f upscaled, %.1f without a scene; "
+                    "jittered draws/s %.0f by the scene depth, %.0f by the scene image alone\n",
+                    frames / seconds, done / seconds, no_scene / seconds, by_depth / seconds,
+                    by_color / seconds);
     }
     if (!passes) {
         std::printf("Native Vulkan: temporal inputs: no G-buffer pass\n");
