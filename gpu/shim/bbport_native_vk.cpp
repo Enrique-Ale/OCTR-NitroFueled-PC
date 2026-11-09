@@ -4619,7 +4619,12 @@ struct TemporalLog {
     char first_cbs[160] = {};
     char projection_at[96] = {};
     u32 recent_draws[4] = {};
+    // lab: the constants holding the camera (from their start), where the projection is in
+    // them, their size, and whether each recent pass drew into the previous pass's depth
+    u32 camera_at = 0, camera_floats = 0;
+    bool same_depth[4] = {};
 };
+Target* temporal_last_depth = nullptr; // capture thread only
 std::mutex temporal_log_mutex;
 TemporalLog temporal_log;
 std::atomic<u64> gbuffer_passes{0}, gbuffer_cameras{0};
@@ -4674,6 +4679,14 @@ void ProbeTemporalInputs(u64 ctx, Target* const colors[8], Target* depth) {
         std::lock_guard lk(temporal_log_mutex);
         std::memcpy(log.recent_draws, temporal_log.recent_draws, sizeof(log.recent_draws));
         std::memcpy(log.projection_at, temporal_log.projection_at, sizeof(log.projection_at));
+        std::memmove(log.same_depth, temporal_log.same_depth + 1, 3);
+        log.same_depth[3] = depth == temporal_last_depth;
+        temporal_last_depth = depth;
+        // the camera stays the last one found (the pass after it may have none)
+        log.camera = temporal_log.camera;
+        log.camera_valid = temporal_log.camera_valid;
+        log.camera_at = temporal_log.camera_at;
+        log.camera_floats = temporal_log.camera_floats;
         temporal_log = log;
     }
     ++t.pass_draws;
@@ -4698,7 +4711,9 @@ void ProbeTemporalInputs(u64 ctx, Target* const colors[8], Target* depth) {
                               "stage %u slot %u (%u bytes) float %u, draw %u of the pass", stage,
                               cb.slot, cb.size, i, t.pass_draws);
                 log.camera.fill(0.0f);
-                std::memcpy(log.camera.data() + 48, f + i, 16 * sizeof(float));
+                log.camera_floats = std::min<u32>(floats, u32(log.camera.size()));
+                std::memcpy(log.camera.data(), f, log.camera_floats * sizeof(float));
+                log.camera_at = i;
                 log.camera_valid = true;
                 break;
             }
@@ -4720,7 +4735,7 @@ void ReportTemporalInputs(double seconds) {
     }
     float fov = 0, near_plane = 0, far_plane = 0;
     if (t.camera_valid) {
-        const float* p = &t.camera[48];
+        const float* p = &t.camera[t.camera_at];
         const float a = p[10], b = p[14];
         if (p[5] > 0.0f && a != 1.0f && a != -1.0f) {
             fov = 2.0f * std::atan(1.0f / p[5]) * 57.29578f;
@@ -4738,6 +4753,18 @@ void ReportTemporalInputs(double seconds) {
                 t.viewport.h, t.viewport.zmin, t.viewport.zmax, fov, near_plane, far_plane,
                 t.projection_at[0] ? t.projection_at : "none", t.first_cbs[0] ? t.first_cbs : "none",
                 t.recent_draws[0], t.recent_draws[1], t.recent_draws[2], t.recent_draws[3]);
+    std::printf("Native Vulkan: temporal inputs: the passes drew into the previous one's depth: "
+                "%d %d %d %d\n",
+                t.same_depth[0], t.same_depth[1], t.same_depth[2], t.same_depth[3]);
+    if (t.camera_valid) {
+        // lab: the camera's constants, one row of 4 floats per line (column-major matrices)
+        std::printf("Native Vulkan: camera constants (%u floats, projection at %u):\n",
+                    t.camera_floats, t.camera_at);
+        for (u32 row = 0; row + 4 <= t.camera_floats && row < 96; row += 4) {
+            std::printf("  [%3u] %12g %12g %12g %12g\n", row, t.camera[row], t.camera[row + 1],
+                        t.camera[row + 2], t.camera[row + 3]);
+        }
+    }
 }
 
 void DrawFrom(u64 ctx, u64 dev, bool indexed, u32 count, u64 index_addr) {
