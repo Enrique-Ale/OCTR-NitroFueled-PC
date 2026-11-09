@@ -4717,18 +4717,36 @@ struct ReprojectVotes {
     void Clear() {
         *this = {};
     }
+    static bool Affine(const float* m) {
+        return m[3] == 0.0f && m[7] == 0.0f && m[11] == 0.0f && std::abs(m[15] - 1.0f) < 1e-6f;
+    }
     void Add(const float* f, u32 floats) {
-        if (floats < 64 || draws >= 256 || !LooksLikeProjection(f + 32) || f[51] != 0.0f ||
-            f[55] != 0.0f || f[59] != 0.0f || std::abs(f[63] - 1.0f) > 1e-6f) {
+        if (floats < 64 || draws >= 256) {
             return;
         }
-        Mat4f inverse;
-        if (!InvertAffine(f + 48, inverse)) {
+        Mat4f m, inverse;
+        if (LooksLikeProjection(f + 32) && Affine(f + 48)) {
+            // previous MVP (0), projection (32), model-view (48)
+            if (!InvertAffine(f + 48, inverse)) {
+                return;
+            }
+            m = MulMat(f, inverse.data());
+            std::memcpy(projection.data(), f + 32, sizeof(projection));
+        } else if (floats >= 80 && LooksLikeProjection(f + 48) && Affine(f + 32) &&
+                   Affine(f + 64)) {
+            // the PS4 Pro path's 528 bytes (as vk_ctr_fsr3 reads them): view (32), projection
+            // (48), the previous frame's view (64): previous projection * previous view *
+            // inverse view
+            if (!InvertAffine(f + 32, inverse)) {
+                return;
+            }
+            const Mat4f prev = MulMat(f + 48, f + 64);
+            m = MulMat(prev.data(), inverse.data());
+            std::memcpy(projection.data(), f + 48, sizeof(projection));
+        } else {
             return;
         }
-        const Mat4f m = MulMat(f, inverse.data());
         ++draws;
-        std::memcpy(projection.data(), f + 32, sizeof(projection));
         Candidate* weakest = &candidates[0];
         for (Candidate& c : candidates) {
             if (c.votes && SameMatrix(c.m, m)) {
