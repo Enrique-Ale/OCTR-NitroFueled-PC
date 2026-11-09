@@ -4603,6 +4603,8 @@ struct TemporalInputs {
     Target* depth = nullptr;    // capture thread only
     Target* velocity = nullptr; // capture thread only
     bool in_pass = false;       // the last draw was a G-buffer draw
+    bool camera_found = false;  // in this pass
+    u32 pass_draws = 0;         // draws in this pass
 };
 TemporalInputs temporal_inputs;
 /// The last G-buffer pass as the report prints it (under temporal_log_mutex).
@@ -4612,10 +4614,22 @@ struct TemporalLog {
     ViewportI viewport{};
     std::array<float, 132> camera{};
     bool camera_valid = false;
+    // lab (temporal inputs): the vertex constants of the pass's first draw (slot:bytes), where a
+    // projection matrix was found (stage, slot, bytes, float index), the draws of recent passes
+    char first_cbs[160] = {};
+    char projection_at[96] = {};
+    u32 recent_draws[4] = {};
 };
 std::mutex temporal_log_mutex;
 TemporalLog temporal_log;
 std::atomic<u64> gbuffer_passes{0}, gbuffer_cameras{0};
+
+/// A perspective projection (column-major, OpenGL style) at `m`: m[11] = -1 or 1, m[15] = 0.
+bool LooksLikeProjection(const float* m) {
+    return std::abs(std::abs(m[11]) - 1.0f) < 1e-4f && std::abs(m[15]) < 1e-6f && m[0] > 0.05f &&
+           m[0] < 20.0f && m[5] > 0.05f && m[5] < 20.0f && std::abs(m[1]) < 1e-4f &&
+           std::abs(m[4]) < 1e-4f && std::isfinite(m[10]) && std::isfinite(m[14]) && m[14] != 0.0f;
+}
 
 void ProbeTemporalInputs(u64 ctx, Target* const colors[8], Target* depth) {
     TemporalInputs& t = temporal_inputs;
@@ -4625,37 +4639,71 @@ void ProbeTemporalInputs(u64 ctx, Target* const colors[8], Target* depth) {
     }
     const bool gbuffer = n == 4 && colors[0] && colors[3] && depth && !colors[4];
     if (!gbuffer) {
+        if (t.in_pass) {
+            std::lock_guard lk(temporal_log_mutex);
+            auto& r = temporal_log.recent_draws;
+            std::memmove(r, r + 1, sizeof(r) - sizeof(r[0]));
+            r[3] = t.pass_draws;
+        }
         t.in_pass = false;
         return;
     }
-    if (t.in_pass) {
-        return; // the pass's first draw carries what is needed
+    const Capture* c = capturing;
+    if (!t.in_pass) {
+        t.in_pass = true;
+        t.camera_found = false;
+        t.pass_draws = 0;
+        t.depth = depth;
+        t.velocity = colors[3];
+        TemporalLog log;
+        log.depth_w = depth->img.width;
+        log.depth_h = depth->img.height;
+        log.depth_format = depth->img.format;
+        log.vel_w = colors[3]->img.width;
+        log.vel_h = colors[3]->img.height;
+        log.vel_format = colors[3]->img.format;
+        log.viewport = R<ViewportI>(ctx + CtxViewport);
+        if (c) {
+            int w = 0;
+            for (u32 k = 0; k < c->cb_count[0] && w < int(sizeof(log.first_cbs)) - 16; ++k) {
+                w += std::snprintf(log.first_cbs + w, sizeof(log.first_cbs) - w, "%s%u:%u",
+                                   k ? " " : "", c->cbs[0][k].slot, c->cbs[0][k].size);
+            }
+        }
+        gbuffer_passes.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard lk(temporal_log_mutex);
+        std::memcpy(log.recent_draws, temporal_log.recent_draws, sizeof(log.recent_draws));
+        std::memcpy(log.projection_at, temporal_log.projection_at, sizeof(log.projection_at));
+        temporal_log = log;
     }
-    t.in_pass = true;
-    t.depth = depth;
-    t.velocity = colors[3];
-    TemporalLog log;
-    log.depth_w = depth->img.width;
-    log.depth_h = depth->img.height;
-    log.depth_format = depth->img.format;
-    log.vel_w = colors[3]->img.width;
-    log.vel_h = colors[3]->img.height;
-    log.vel_format = colors[3]->img.format;
-    log.viewport = R<ViewportI>(ctx + CtxViewport);
-    if (const Capture* c = capturing) {
-        for (u32 k = 0; k < c->cb_count[0]; ++k) {
-            const Capture::Cb& cb = c->cbs[0][k];
-            if (cb.size == 528) {
-                std::memcpy(log.camera.data(), c->bytes.data() + cb.offset, 528);
-                log.camera_valid = log.camera[48] != 0.0f && log.camera[53] != 0.0f;
+    ++t.pass_draws;
+    if (t.camera_found || !c) {
+        return;
+    }
+    // the camera: the first constants of the pass holding a projection matrix (any stage)
+    for (u32 stage = 0; stage < 3 && !t.camera_found; ++stage) {
+        for (u32 k = 0; k < c->cb_count[stage] && !t.camera_found; ++k) {
+            const Capture::Cb& cb = c->cbs[stage][k];
+            const float* f = reinterpret_cast<const float*>(c->bytes.data() + cb.offset);
+            const u32 floats = cb.size / 4;
+            for (u32 i = 0; i + 16 <= floats; i += 4) {
+                if (!LooksLikeProjection(f + i)) {
+                    continue;
+                }
+                t.camera_found = true;
+                gbuffer_cameras.fetch_add(1, std::memory_order_relaxed);
+                std::lock_guard lk(temporal_log_mutex);
+                TemporalLog& log = temporal_log;
+                std::snprintf(log.projection_at, sizeof(log.projection_at),
+                              "stage %u slot %u (%u bytes) float %u, draw %u of the pass", stage,
+                              cb.slot, cb.size, i, t.pass_draws);
+                log.camera.fill(0.0f);
+                std::memcpy(log.camera.data() + 48, f + i, 16 * sizeof(float));
+                log.camera_valid = true;
                 break;
             }
         }
     }
-    gbuffer_passes.fetch_add(1, std::memory_order_relaxed);
-    gbuffer_cameras.fetch_add(log.camera_valid, std::memory_order_relaxed);
-    std::lock_guard lk(temporal_log_mutex);
-    temporal_log = log;
 }
 
 /// One line every 5 seconds.
@@ -4682,11 +4730,14 @@ void ReportTemporalInputs(double seconds) {
     }
     std::printf("Native Vulkan: temporal inputs: %.1f G-buffer passes/s, %.1f with the camera; "
                 "depth %ux%u %s, velocity %ux%u %s; viewport %d,%d %dx%d z %.2f-%.2f; camera fov "
-                "%.1f deg, near %.2f, far %.0f\n",
+                "%.1f deg, near %.2f, far %.0f; projection at %s; first draw's vertex constants "
+                "(slot:bytes) %s; draws in the last passes %u %u %u %u\n",
                 passes / seconds, cams / seconds, t.depth_w, t.depth_h,
                 vk::to_string(t.depth_format).c_str(), t.vel_w, t.vel_h,
                 vk::to_string(t.vel_format).c_str(), t.viewport.x, t.viewport.y, t.viewport.w,
-                t.viewport.h, t.viewport.zmin, t.viewport.zmax, fov, near_plane, far_plane);
+                t.viewport.h, t.viewport.zmin, t.viewport.zmax, fov, near_plane, far_plane,
+                t.projection_at[0] ? t.projection_at : "none", t.first_cbs[0] ? t.first_cbs : "none",
+                t.recent_draws[0], t.recent_draws[1], t.recent_draws[2], t.recent_draws[3]);
 }
 
 void DrawFrom(u64 ctx, u64 dev, bool indexed, u32 count, u64 index_addr) {
