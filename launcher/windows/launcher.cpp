@@ -1624,6 +1624,8 @@ void StartGame() {
         SetEnv(L"BB_HDR", "1");
         const std::string peak = a.launcher.Get("hdr_peak", "0");
         if (peak != "0") SetEnv(L"BB_HDR_PEAK", peak);
+        const std::string gain = a.launcher.Get("hdr_gain", "1");
+        if (gain != "1") SetEnv(L"BB_HDR_GAIN", gain);
     }
     SetEnv(L"BB_DLC", a.launcher.Flag("dlc", true) ? "1" : "0");
     SetEnv(L"BB_DLC_DISABLED", a.launcher.Get("dlc_disabled"));
@@ -3213,6 +3215,16 @@ void SettingsTab() {
                      "más brillantes del juego se ajustan a él en vez de quemarse.",
                      "Your display's peak brightness (from the Windows HDR calibration): the game's "
                      "brightest parts are fitted to it instead of clipping."));
+        static constexpr Choice kHdrGain[] = {{"60%", "60%", "0.6"},   {"70%", "70%", "0.7"},
+                                              {"80%", "80%", "0.8"},   {"90%", "90%", "0.9"},
+                                              {"100% (el juego)", "100% (the game)", "1"},
+                                              {"115%", "115%", "1.15"}, {"130%", "130%", "1.3"}};
+        ChoiceCombo(T("Blanco de referencia HDR", "HDR paper white"), "hdr_gain", kHdrGain, "1");
+        HelpMarker(T("Cuánto brillan los blancos normales (menús, textos, cielo) frente a lo que el juego "
+                     "pone. Bájalo si los menús se ven quemados; los brillos fuertes siguen limitados al "
+                     "brillo máximo.",
+                     "How bright ordinary whites (menus, text, sky) are against what the game puts out. "
+                     "Lower it if menus look blown out; strong highlights stay within the peak brightness."));
     }
     if (temporal == "dlss") {
         static constexpr Choice kQuality[] = {

@@ -4777,6 +4777,7 @@ ReprojectVotes reproject_votes; // capture thread only
 /// DLSS (capture thread): what this frame's G-buffer passes gave so far.
 struct SceneFrame {
     Target* depth = nullptr;
+    u32 draws = 0; // of the frame's biggest G-buffer pass
     Target* velocity = nullptr;
     bool camera = false;
     Mat4f reproject{}, projection{};
@@ -4785,7 +4786,6 @@ struct SceneFrame {
 };
 SceneFrame scene_frame;
 Target* jitter_depth = nullptr;      // the last frame's scene depth: draws into it are jittered
-Target* jitter_color = nullptr;      // and the scene image DLSS read, for draws without that depth
 std::array<float, 2> scene_jitter{}; // by this much (pixels), this frame
 Target* last_color = nullptr;        // the last draw's first color target (not a display buffer)
 bool last_display = false;           // the last draw was into a display buffer
@@ -4809,6 +4809,7 @@ void ProbeTemporalInputs(u64 ctx, Target* const colors[8], Target* depth) {
             auto& r = temporal_log.recent_draws;
             std::memmove(r, r + 1, sizeof(r) - sizeof(r[0]));
             r[3] = t.pass_draws;
+            scene_frame.draws = std::max(scene_frame.draws, t.pass_draws);
             const auto& best = reproject_votes.Best();
             if (best.votes >= 4) {
                 scene_frame.camera = true;
@@ -4931,8 +4932,8 @@ struct UpscaleJob {
 std::array<UpscaleJob, 16> upscale_jobs;
 u32 upscale_job_next = 0;
 std::atomic<u64> upscale_frames{0}, upscale_done{0}, upscale_no_scene{0};
-// draws jittered by the scene depth, and by the scene image alone (no scene depth)
-std::atomic<u64> jittered_by_depth{0}, jittered_by_color{0};
+// draws jittered; frames taken as a 3D scene, and as a menu (no history)
+std::atomic<u64> jittered_by_depth{0}, upscale_scene{0}, upscale_menu{0};
 
 /// Capture thread, for each draw: scene draws are jittered for DLSS, and the display pass's
 /// first draw (the frame's end, before the HUD) takes this frame's inputs.
@@ -4946,13 +4947,10 @@ void NativeTemporal(u64 ctx, DrawPacket& d, Target* const colors[8], Target* dep
         scene_frame.viewport = d.viewport;
         scene_frame.has_viewport = true;
     }
-    // draws into the scene depth or the scene image (a background drawn without the depth, as
-    // at the character select, would shake otherwise: DLSS takes the jitter off every pixel),
-    // but full-screen passes (a quad: the edge column would be left)
-    if (((depth && depth == jitter_depth) || (colors[0] && colors[0] == jitter_color)) &&
-        count > 6) {
-        (depth && depth == jitter_depth ? jittered_by_depth : jittered_by_color)
-            .fetch_add(1, std::memory_order_relaxed);
+    // draws into the scene depth but full-screen passes (a quad: the edge column would be left);
+    // not the 2D drawn into the scene image without it (menus), which DLSS would smear
+    if (depth && depth == jitter_depth && count > 6) {
+        jittered_by_depth.fetch_add(1, std::memory_order_relaxed);
         d.viewport.x += scene_jitter[0];
         d.viewport.y += scene_jitter[1];
     }
@@ -4976,6 +4974,13 @@ void NativeTemporal(u64 ctx, DrawPacket& d, Target* const colors[8], Target* dep
         sampled |= last_color && slot.target == last_color;
     }
     const SceneFrame& sf = scene_frame;
+    // a menu (a small 3D scene under 2D drawn into the same image: the character select, the
+    // results): DLSS starts over each frame, so the 2D and the waving flag leave no trails
+    static const u32 menu_draws = [] {
+        const char* v = std::getenv("BB_VK_DLSS_MENU_DRAWS");
+        return v ? u32(std::strtoul(v, nullptr, 10)) : 100u;
+    }();
+    const bool menu = sf.draws < menu_draws;
     if (sampled && sf.depth && sf.velocity && sf.has_viewport && DlssSource(last_color->img.format)) {
         UpscaleJob& j = upscale_jobs[upscale_job_next++ % upscale_jobs.size()];
         j = {};
@@ -4995,7 +5000,8 @@ void NativeTemporal(u64 ctx, DrawPacket& d, Target* const colors[8], Target* dep
         j.zoffset = (vp.maxDepth + vp.minDepth) * 0.5f;
         const bool jittered = jitter_depth == sf.depth;
         j.jitter = jittered ? scene_jitter : std::array<float, 2>{};
-        j.reset = !jittered;
+        j.reset = !jittered || menu;
+        (menu ? upscale_menu : upscale_scene).fetch_add(1, std::memory_order_relaxed);
         j.out_w = colors[0]->img.width;
         j.out_h = colors[0]->img.height;
         d.upscale = &j;
@@ -5003,8 +5009,7 @@ void NativeTemporal(u64 ctx, DrawPacket& d, Target* const colors[8], Target* dep
         upscale_no_scene.fetch_add(1, std::memory_order_relaxed);
     }
     // only a frame DLSS takes is jittered: its jitter is taken off again
-    jitter_depth = d.upscale ? sf.depth : nullptr;
-    jitter_color = d.upscale ? last_color : nullptr;
+    jitter_depth = d.upscale && !menu ? sf.depth : nullptr;
     scene_jitter = Dlss::NextJitter();
     scene_frame = {};
 }
@@ -5142,11 +5147,11 @@ void ReportTemporalInputs(double seconds) {
     if (Dlss::Wanted()) {
         const u64 frames = upscale_frames.exchange(0), done = upscale_done.exchange(0),
                   no_scene = upscale_no_scene.exchange(0), by_depth = jittered_by_depth.exchange(0),
-                  by_color = jittered_by_color.exchange(0);
+                  scene = upscale_scene.exchange(0), menu = upscale_menu.exchange(0);
         std::printf("Native Vulkan: DLSS: %.1f frames/s, %.1f upscaled, %.1f without a scene; "
-                    "jittered draws/s %.0f by the scene depth, %.0f by the scene image alone\n",
-                    frames / seconds, done / seconds, no_scene / seconds, by_depth / seconds,
-                    by_color / seconds);
+                    "%.1f as a scene, %.1f as a menu (no history); jittered draws/s %.0f\n",
+                    frames / seconds, done / seconds, no_scene / seconds, scene / seconds,
+                    menu / seconds, by_depth / seconds);
     }
     if (!passes) {
         std::printf("Native Vulkan: temporal inputs: no G-buffer pass\n");
