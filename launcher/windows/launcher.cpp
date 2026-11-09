@@ -3151,12 +3151,16 @@ void SettingsTab() {
                                                    {"AMD FSR 3 (experimental)", "AMD FSR 3 (experimental)", "fsr3"},
                                                    {"NVIDIA DLSS (experimental)", "NVIDIA DLSS (experimental)", "dlss"},
                                                    {"AMD FSR 4 (experimental)", "AMD FSR 4 (experimental)", "fsr4"}};
+        // the native engine has DLSS of its own (gpu/shim/bbport_native_vk_dlss.cpp); FSR 3 and
+        // FSR 4 live in shadPS4's rasterizer only
         static constexpr Choice kTemporalNative[] = {{"Desactivado", "Off", "off"},
-                                                     {"AMD FSR 1", "AMD FSR 1", "fsr1"}};
+                                                     {"AMD FSR 1", "AMD FSR 1", "fsr1"},
+                                                     {"NVIDIA DLSS (experimental)", "NVIDIA DLSS (experimental)", "dlss"}};
         const bool native = a.game.Get("renderer") == "native";
         const bool fsr4 = Fsr4FilesPresent();
         const bool picked = native ? GameChoiceCombo(T("Escalado", "Upscaling"), "temporal", kTemporalNative,
-                                                     temporal == "off" ? "off" : "fsr1", 16.0f)
+                                                     temporal == "off" || temporal == "dlss" ? temporal.c_str() : "fsr1",
+                                                     16.0f)
                                    : GameChoiceCombo(T("Escalado", "Upscaling"), "temporal", kTemporalFsr4,
                                                      temporal.c_str(), 16.0f);
         if (picked) {
@@ -3164,9 +3168,9 @@ void SettingsTab() {
             a.game.Erase("fsr3");
             SaveGameIni();
         }
-        if (native && (temporal == "fsr3" || temporal == "dlss" || temporal == "fsr4")) {
-            ImGui::TextColored(kGrey, "%s", T("FSR 3, FSR 4 y DLSS no funcionan con el motor nativo: se usa FSR 1.",
-                                              "FSR 3, FSR 4 and DLSS do not work with the native engine: FSR 1 is used."));
+        if (native && (temporal == "fsr3" || temporal == "fsr4")) {
+            ImGui::TextColored(kGrey, "%s", T("FSR 3 y FSR 4 no funcionan con el motor nativo: se usa FSR 1.",
+                                              "FSR 3 and FSR 4 do not work with the native engine: FSR 1 is used."));
         } else if (temporal == "fsr4" && !fsr4) {
             ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetFontSize() * 34.0f);
             ImGui::TextColored(kGrey, "%s", T("FSR 4 necesita sus archivos, que no vienen con el juego: pon la carpeta "
