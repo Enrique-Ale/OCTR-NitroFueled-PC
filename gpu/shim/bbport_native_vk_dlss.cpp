@@ -348,10 +348,31 @@ bool Upscale(const Frame& f) {
         params.depth_jitter[1] = f.zoffset;
         params.depth_jitter[2] = f.jitter[0];
         params.depth_jitter[3] = f.jitter[1];
-        // moving objects stay still on the screen (vk_ctr_fsr3's default, measured best)
-        params.object[2] = 127.0f / 255.0f;
-        params.flags = 1u | (f.camera && params.proj[0] != 0.0f && params.proj[1] != 0.0f ? 0x200u
-                                                                                         : 0u);
+        // moving objects stay still on the screen (vk_ctr_fsr3's default, measured best);
+        // BB_FSR3_MV="sx,sy,bias,mode,cx,cy" adds their own motion, as under shadPS4
+        static const auto decode = [] {
+            struct {
+                float sx = 0, sy = 0, bias = 127.0f / 255.0f;
+                u32 mode = 0, cx = 1, cy = 0;
+            } d;
+            if (const char* env = std::getenv("BB_FSR3_MV")) {
+                std::sscanf(env, "%f,%f,%f,%u,%u,%u", &d.sx, &d.sy, &d.bias, &d.mode, &d.cx, &d.cy);
+                d.cx &= 3;
+                d.cy &= 3;
+                d.mode = std::min(d.mode, 2u);
+            }
+            std::printf("Native Vulkan: DLSS: moving objects %s (channels %u/%u - %.4f) * %g/%g px; "
+                        "jitter %s\n",
+                        d.mode == 0 ? "still" : d.mode == 1 ? "linear" : "squared", d.cx, d.cy,
+                        d.bias, d.sx, d.sy, std::getenv("BB_FSR3_NO_JITTER") ? "off" : "on");
+            return d;
+        }();
+        params.object[0] = decode.sx;
+        params.object[1] = decode.sy;
+        params.object[2] = decode.bias;
+        params.object[3] = float(decode.mode);
+        const bool camera = f.camera && params.proj[0] != 0.0f && params.proj[1] != 0.0f;
+        params.flags = decode.cx | (decode.cy << 2) | (camera ? 0x200u : 0u);
         cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *inputs_pipeline);
         cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pipeline_layout, 0, writes);
         cmd.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params),
