@@ -4623,6 +4623,11 @@ struct TemporalLog {
     // them, their size, and whether each recent pass drew into the previous pass's depth
     u32 camera_at = 0, camera_floats = 0;
     bool same_depth[4] = {};
+    // the camera's motion of the last pass that had it: current view space -> previous clip
+    // space (column-major), from the draws of still objects, and how many draws agreed
+    std::array<float, 16> reproject{};
+    std::array<float, 16> projection{};
+    u32 reproject_votes = 0, reproject_draws = 0;
 };
 Target* temporal_last_depth = nullptr; // capture thread only
 std::mutex temporal_log_mutex;
@@ -4630,6 +4635,112 @@ TemporalLog temporal_log;
 std::atomic<u64> gbuffer_passes{0}, gbuffer_cameras{0};
 
 /// A perspective projection (column-major, OpenGL style) at `m`: m[11] = -1 or 1, m[15] = 0.
+bool LooksLikeProjection(const float* m);
+
+/// 4x4 column-major helpers for the camera's motion.
+using Mat4f = std::array<float, 16>;
+Mat4f MulMat(const float* a, const float* b) {
+    Mat4f r{};
+    for (int c = 0; c < 4; ++c) {
+        for (int row = 0; row < 4; ++row) {
+            float v = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+                v += a[k * 4 + row] * b[c * 4 + k];
+            }
+            r[c * 4 + row] = v;
+        }
+    }
+    return r;
+}
+/// Inverse of an affine matrix (last row 0 0 0 1); false when singular.
+bool InvertAffine(const float* m, Mat4f& out) {
+    const float a = m[0], b = m[4], c = m[8], d = m[1], e = m[5], f = m[9], g = m[2], h = m[6],
+                i = m[10];
+    const float A = e * i - f * h, B = f * g - d * i, C = d * h - e * g;
+    const float det = a * A + b * B + c * C;
+    if (!std::isfinite(det) || std::abs(det) < 1e-12f) {
+        return false;
+    }
+    const float k = 1.0f / det;
+    // rows of the inverse 3x3
+    const float r00 = A * k, r01 = (c * h - b * i) * k, r02 = (b * f - c * e) * k;
+    const float r10 = B * k, r11 = (a * i - c * g) * k, r12 = (c * d - a * f) * k;
+    const float r20 = C * k, r21 = (b * g - a * h) * k, r22 = (a * e - b * d) * k;
+    const float tx = m[12], ty = m[13], tz = m[14];
+    out = {r00, r10, r20, 0.0f, r01, r11, r21, 0.0f, r02, r12, r22, 0.0f,
+           -(r00 * tx + r01 * ty + r02 * tz), -(r10 * tx + r11 * ty + r12 * tz),
+           -(r20 * tx + r21 * ty + r22 * tz), 1.0f};
+    return true;
+}
+bool SameMatrix(const Mat4f& a, const Mat4f& b) {
+    float scale = 0.0f;
+    for (int k = 0; k < 16; ++k) {
+        scale = std::max(scale, std::abs(a[k]));
+    }
+    // rotation-sized elements and translation-sized ones: relative to their columns
+    for (int k = 0; k < 16; ++k) {
+        const float tol = (k >= 12 ? 1e-3f * scale : 1e-3f) + 1e-4f * std::abs(a[k]);
+        if (std::abs(a[k] - b[k]) > tol) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The camera's motion of a pass: each draw's vertex constants hold its previous
+/// model-view-projection (floats 0-15), the projection (32-47) and the model-view (48-63), so
+/// previous MVP * inverse(model-view) maps view space to the previous frame's clip space; it is
+/// the camera's motion for still objects, which the most draws agree on.
+struct ReprojectVotes {
+    struct Candidate {
+        Mat4f m{};
+        u32 votes = 0;
+    };
+    std::array<Candidate, 6> candidates{};
+    Mat4f projection{};
+    u32 draws = 0;
+    void Clear() {
+        *this = {};
+    }
+    void Add(const float* f, u32 floats) {
+        if (floats < 64 || draws >= 256 || !LooksLikeProjection(f + 32) || f[51] != 0.0f ||
+            f[55] != 0.0f || f[59] != 0.0f || std::abs(f[63] - 1.0f) > 1e-6f) {
+            return;
+        }
+        Mat4f inverse;
+        if (!InvertAffine(f + 48, inverse)) {
+            return;
+        }
+        const Mat4f m = MulMat(f, inverse.data());
+        ++draws;
+        std::memcpy(projection.data(), f + 32, sizeof(projection));
+        Candidate* weakest = &candidates[0];
+        for (Candidate& c : candidates) {
+            if (c.votes && SameMatrix(c.m, m)) {
+                ++c.votes;
+                return;
+            }
+            if (c.votes < weakest->votes) {
+                weakest = &c;
+            }
+        }
+        if (weakest->votes <= 1) {
+            weakest->m = m;
+            weakest->votes = 1;
+        }
+    }
+    const Candidate& Best() const {
+        const Candidate* best = &candidates[0];
+        for (const Candidate& c : candidates) {
+            if (c.votes > best->votes) {
+                best = &c;
+            }
+        }
+        return *best;
+    }
+};
+ReprojectVotes reproject_votes; // capture thread only
+
 bool LooksLikeProjection(const float* m) {
     return std::abs(std::abs(m[11]) - 1.0f) < 1e-4f && std::abs(m[15]) < 1e-6f && m[0] > 0.05f &&
            m[0] < 20.0f && m[5] > 0.05f && m[5] < 20.0f && std::abs(m[1]) < 1e-4f &&
@@ -4649,6 +4760,13 @@ void ProbeTemporalInputs(u64 ctx, Target* const colors[8], Target* depth) {
             auto& r = temporal_log.recent_draws;
             std::memmove(r, r + 1, sizeof(r) - sizeof(r[0]));
             r[3] = t.pass_draws;
+            const auto& best = reproject_votes.Best();
+            if (best.votes) {
+                temporal_log.reproject = best.m;
+                temporal_log.projection = reproject_votes.projection;
+                temporal_log.reproject_votes = best.votes;
+                temporal_log.reproject_draws = reproject_votes.draws;
+            }
         }
         t.in_pass = false;
         return;
@@ -4687,9 +4805,23 @@ void ProbeTemporalInputs(u64 ctx, Target* const colors[8], Target* depth) {
         log.camera_valid = temporal_log.camera_valid;
         log.camera_at = temporal_log.camera_at;
         log.camera_floats = temporal_log.camera_floats;
+        log.reproject = temporal_log.reproject;
+        log.projection = temporal_log.projection;
+        log.reproject_votes = temporal_log.reproject_votes;
+        log.reproject_draws = temporal_log.reproject_draws;
         temporal_log = log;
+        reproject_votes.Clear();
     }
     ++t.pass_draws;
+    if (c) {
+        for (u32 k = 0; k < c->cb_count[0]; ++k) {
+            const Capture::Cb& cb = c->cbs[0][k];
+            if (cb.slot == 0) {
+                reproject_votes.Add(
+                    reinterpret_cast<const float*>(c->bytes.data() + cb.offset), cb.size / 4);
+            }
+        }
+    }
     if (t.camera_found || !c) {
         return;
     }
@@ -4756,7 +4888,29 @@ void ReportTemporalInputs(double seconds) {
     std::printf("Native Vulkan: temporal inputs: the passes drew into the previous one's depth: "
                 "%d %d %d %d\n",
                 t.same_depth[0], t.same_depth[1], t.same_depth[2], t.same_depth[3]);
-    if (t.camera_valid) {
+    static u32 dumped_sizes[8] = {};
+    const bool new_size = t.camera_valid &&
+                          std::find(std::begin(dumped_sizes), std::end(dumped_sizes),
+                                    t.camera_floats) == std::end(dumped_sizes);
+    if (new_size) {
+        if (u32* slot = std::find(std::begin(dumped_sizes), std::end(dumped_sizes), 0u);
+            slot != std::end(dumped_sizes)) {
+            *slot = t.camera_floats;
+        }
+    }
+    if (t.reproject_votes) {
+        // how far the camera moved: the reprojection against the projection alone
+        float moved = 0.0f;
+        for (int k = 0; k < 16; ++k) {
+            moved = std::max(moved, std::abs(t.reproject[k] - t.projection[k]));
+        }
+        const auto& m = t.reproject;
+        std::printf("Native Vulkan: camera motion: %u of %u draws agree; differs from the "
+                    "projection by %g; rows x [%g %g %g %g] y [%g %g %g %g] w [%g %g %g %g]\n",
+                    t.reproject_votes, t.reproject_draws, moved, m[0], m[4], m[8], m[12], m[1],
+                    m[5], m[9], m[13], m[3], m[7], m[11], m[15]);
+    }
+    if (new_size) {
         // lab: the camera's constants, one row of 4 floats per line (column-major matrices)
         std::printf("Native Vulkan: camera constants (%u floats, projection at %u):\n",
                     t.camera_floats, t.camera_at);
