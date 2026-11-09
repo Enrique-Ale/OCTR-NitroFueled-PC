@@ -1620,7 +1620,11 @@ void StartGame() {
     SetEnv(L"BB_GAMEPAD", a.launcher.Get("gamepad"));
     SetEnv(L"BB_MENU_LANGUAGE", g_spanish ? "es" : "en");  // the in-game menu follows the launcher
     SetEnv(L"BB_SAVE_LOG", a.launcher.Flag("save_log", false) ? "1" : "");
-    if (a.launcher.Flag("hdr", false)) SetEnv(L"BB_HDR", "1");  // off: BB_HDR as set outside
+    if (a.launcher.Flag("hdr", false)) {  // off: BB_HDR as set outside
+        SetEnv(L"BB_HDR", "1");
+        const std::string peak = a.launcher.Get("hdr_peak", "0");
+        if (peak != "0") SetEnv(L"BB_HDR_PEAK", peak);
+    }
     SetEnv(L"BB_DLC", a.launcher.Flag("dlc", true) ? "1" : "0");
     SetEnv(L"BB_DLC_DISABLED", a.launcher.Get("dlc_disabled"));
     SetEnv(L"BB_FULLSCREEN", "");  // bbport.ini's fullscreen= (the menu switch) decides
@@ -3197,6 +3201,19 @@ void SettingsTab() {
                    "RTX HDR para este juego. Experimental.",
                    "The game's own HDR output (HDR10). Also turn on Windows HDR and turn off RTX HDR for "
                    "this game. Experimental."));
+    if (a.launcher.Flag("hdr", false)) {
+        static constexpr Choice kHdrPeak[] = {{"Como el juego", "As the game", "0"},
+                                              {"400 nits", "400 nits", "400"},
+                                              {"450 nits", "450 nits", "450"},
+                                              {"600 nits", "600 nits", "600"},
+                                              {"800 nits", "800 nits", "800"},
+                                              {"1000 nits", "1000 nits", "1000"}};
+        ChoiceCombo(T("Brillo máximo HDR", "HDR peak brightness"), "hdr_peak", kHdrPeak, "0");
+        HelpMarker(T("El brillo máximo de tu pantalla (el de la calibración HDR de Windows): las partes "
+                     "más brillantes del juego se ajustan a él en vez de quemarse.",
+                     "Your display's peak brightness (from the Windows HDR calibration): the game's "
+                     "brightest parts are fitted to it instead of clipping."));
+    }
     if (temporal == "dlss") {
         static constexpr Choice kQuality[] = {
             {"Automática (resolución interna)", "Auto (internal resolution)", "auto"},
