@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include "common/assert.h"
@@ -114,6 +115,8 @@ void Swapchain::SetHDR(bool hdr) {
     }
 
     needs_hdr = hdr;
+    std::printf("Swapchain: HDR %s\n", hdr ? "on (BT.2020 PQ, 10-bit)" : "off");
+    std::fflush(stdout);
     Recreate(width, height);
     ImGui::Core::OnSurfaceFormatChange(needs_hdr ? SURFACE_FORMAT_HDR.format
                                                  : surface_format.format);

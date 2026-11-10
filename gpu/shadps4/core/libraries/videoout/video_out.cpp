@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -368,6 +370,16 @@ s32 PS4_SYSV_ABI sceVideoOutGetDeviceCapabilityInfo(
             pDeviceCapabilityInfo->capability |= ORBIS_VIDEO_OUT_DEVICE_CAPABILITY_BT2020_PQ;
         }
     }
+    // bbport: why a run is or is not in HDR (once)
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        std::printf("VideoOut: HDR %s (display and BB_HDR: %s, the game's param.sfo: %s)\n",
+                    pDeviceCapabilityInfo->capability ? "offered to the game" : "not offered",
+                    presenter->IsHDRSupported() ? "yes" : "no",
+                    Common::ElfInfo::Instance().GetPSFAttributes().support_hdr ? "HDR" : "no HDR");
+        std::fflush(stdout);
+    }
     return ORBIS_OK;
 }
 
@@ -433,6 +445,11 @@ s32 PS4_SYSV_ABI sceVideoOutConfigureOutputMode_(s32 handle, u32 reserved, const
         return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
     }
 
+    std::printf("VideoOut: the game asks for %s output\n",
+                mode->colorimetry == OrbisVideoOutColorimetry::Bt2020PQ ? "HDR (BT.2020 PQ)"
+                : mode->colorimetry == OrbisVideoOutColorimetry::Any    ? "SDR"
+                                                                        : "another colorimetry");
+    std::fflush(stdout);
     switch (mode->colorimetry) {
     case OrbisVideoOutColorimetry::Any:
         port->is_hdr = false;
