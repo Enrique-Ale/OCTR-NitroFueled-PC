@@ -4975,13 +4975,18 @@ void NativeTemporal(u64 ctx, DrawPacket& d, Target* const colors[8], Target* dep
     }
     const SceneFrame& sf = scene_frame;
     // a menu (a small 3D scene under 2D drawn into the same image: the character select, the
-    // results): DLSS starts over each frame, so the 2D and the waving flag leave no trails
+    // results): DLSS stays out of it, so the 2D and the waving flag leave no trails
     static const u32 menu_draws = [] {
         const char* v = std::getenv("BB_VK_DLSS_MENU_DRAWS");
         return v ? u32(std::strtoul(v, nullptr, 10)) : 100u;
     }();
     const bool menu = sf.draws < menu_draws;
-    if (sampled && sf.depth && sf.velocity && sf.has_viewport && DlssSource(last_color->img.format)) {
+    if (menu && sampled) {
+        // menus are shown as the game draws them: even without history, DLSS doubled the
+        // results screen's scrolling background (2026-11-10)
+        upscale_menu.fetch_add(1, std::memory_order_relaxed);
+    } else if (sampled && sf.depth && sf.velocity && sf.has_viewport &&
+               DlssSource(last_color->img.format)) {
         UpscaleJob& j = upscale_jobs[upscale_job_next++ % upscale_jobs.size()];
         j = {};
         j.source = last_color;
@@ -5000,8 +5005,8 @@ void NativeTemporal(u64 ctx, DrawPacket& d, Target* const colors[8], Target* dep
         j.zoffset = (vp.maxDepth + vp.minDepth) * 0.5f;
         const bool jittered = jitter_depth == sf.depth;
         j.jitter = jittered ? scene_jitter : std::array<float, 2>{};
-        j.reset = !jittered || menu;
-        (menu ? upscale_menu : upscale_scene).fetch_add(1, std::memory_order_relaxed);
+        j.reset = !jittered;
+        upscale_scene.fetch_add(1, std::memory_order_relaxed);
         j.out_w = colors[0]->img.width;
         j.out_h = colors[0]->img.height;
         d.upscale = &j;
@@ -5149,7 +5154,7 @@ void ReportTemporalInputs(double seconds) {
                   no_scene = upscale_no_scene.exchange(0), by_depth = jittered_by_depth.exchange(0),
                   scene = upscale_scene.exchange(0), menu = upscale_menu.exchange(0);
         std::printf("Native Vulkan: DLSS: %.1f frames/s, %.1f upscaled, %.1f without a scene; "
-                    "%.1f as a scene, %.1f as a menu (no history); jittered draws/s %.0f\n",
+                    "%.1f as a scene, %.1f menus left as drawn; jittered draws/s %.0f\n",
                     frames / seconds, done / seconds, no_scene / seconds, scene / seconds,
                     menu / seconds, by_depth / seconds);
     }
