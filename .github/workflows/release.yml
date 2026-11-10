@@ -68,6 +68,9 @@ jobs:
       - name: Build inside Nix shell
         run: nix-shell shell.nix --run 'BB_IN_NIX_SHELL=1 bash build.sh'
       - name: Package AppImage
+        # test branch: the build is untagged (dev-<hash>), so its id never equals git describe
+        env:
+          BB_ALLOW_DIRTY: "1"
         run: bash packaging/appimage.sh
       - name: Name and verify AppImage
         shell: bash
