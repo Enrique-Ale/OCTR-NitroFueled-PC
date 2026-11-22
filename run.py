@@ -1363,7 +1363,9 @@ def launch(args, restarted=False):
                     env[key] = previous
             renderer_changes.clear()
             previous = env.copy()
-            if ini_value(config, 'renderer') == 'd3d11':
+            # BB_RENDERER=d3d11|native|shadps4 (lab: tools/modtest.py) wins over bbport.ini, for this launch
+            renderer = env.get('BB_RENDERER') or ini_value(config, 'renderer')
+            if renderer == 'd3d11':
                 env['BB_D3D11'] = '1'
                 shaders = out / 'd3d11-shaders' / 'hlsl'
                 prepare_d3d11_shaders(game, out / 'd3d11-shaders')  # quick when ready
@@ -1373,7 +1375,7 @@ def launch(args, restarted=False):
                     say('Direct3D 11 (experimental)')
                 else:
                     say('Direct3D 11 (experimental): no shaders in out/d3d11-shaders, so no picture of the game')
-            if (ini_value(config, 'renderer') or 'shadps4') == 'native' and 'BB_NATIVE_VK' not in env:
+            if (renderer or 'shadps4') == 'native' and 'BB_NATIVE_VK' not in env:
                 if not native_shaders.supported(title_id, app_version):
                     say(f'Native Vulkan: only the USA or EU 1.21 game (CUSA13795, CUSA14876) for now; this is {title_id} '
                         f'{app_version}, so the game starts with Vulkan (shadPS4)')

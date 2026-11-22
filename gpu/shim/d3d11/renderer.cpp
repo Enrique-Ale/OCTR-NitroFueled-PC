@@ -7,12 +7,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cmath>
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <tuple>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -2120,6 +2123,203 @@ void SaveScreenshot(const char* path) {
     g_ctx->Unmap(st.Get(), 0);
 }
 
+// ------------------------------------------------------------------ mod test (BB_MODTEST_DIR)
+// A lab aid for mod makers, driven by tools/modtest.py. Without BB_MODTEST_DIR nothing here runs.
+// A file <dir>/request holding a name asks for one capture: the game's next frame, from one flip to
+// the next as F11's, into <dir>/<name>/: draws.txt (the F11 log), the render targets, draws.jsonl
+// (one JSON object per draw: shaders, blend and depth state, textures, constants), screen.bmp
+// (the picture shown right after, before the overlay) and RenderDoc's capture when RenderDoc is
+// loaded (BB_RENDERDOC); <dir>/<name>/done is written last. "quit" ends the game.
+const fs::path& ModtestDir() {
+    static const fs::path dir = [] {
+        wchar_t v[1024] = {};
+        const DWORD n = GetEnvironmentVariableW(L"BB_MODTEST_DIR", v, 1024);
+        return n && n < 1024 ? fs::path(v) : fs::path();
+    }();
+    return dir;
+}
+FILE* g_modtest_json = nullptr;  // draws.jsonl of the capture running
+std::string g_modtest_name;      // the capture asked for: armed, running or waiting for its picture
+int g_modtest_stage = 0;         // 0 none, 1 armed or running, 2 captured (picture at the next present)
+u64 g_modtest_draws = 0;         // draws written to draws.jsonl
+
+// Whether a pixel shader can kill pixels (discard: the alpha test / clip of cut-out materials).
+// The SHEX/SHDR chunk of the DXBC, one instruction at a time (opcode 13 is discard).
+bool ShaderDiscards(const std::vector<u8>& code) {
+    const auto word = [&](size_t o) { u32 w = 0; if (o + 4 <= code.size()) memcpy(&w, code.data() + o, 4); return w; };
+    if (code.size() < 32 || memcmp(code.data(), "DXBC", 4) != 0) return false;
+    for (u32 c = 0, chunks = word(28); c < chunks && c < 32; c++) {
+        const size_t chunk = word(32 + c * 4);
+        const u32 tag = word(chunk), size = word(chunk + 4);
+        if (tag != 0x58454853u && tag != 0x52444853u) continue;  // "SHEX", "SHDR"
+        const size_t begin = chunk + 8, end = std::min(code.size(), begin + size);
+        size_t at = begin + 8;  // past the version and length tokens
+        while (at + 4 <= end) {
+            const u32 token = word(at);
+            const u32 opcode = token & 0x7ff;
+            u32 length = (token >> 24) & 0x7f;
+            if (opcode == 0x35) length = word(at + 4);  // custom data: its length follows
+            if (opcode == 13) return true;
+            if (!length) break;
+            at += (size_t)length * 4;
+        }
+    }
+    return false;
+}
+
+void JsonString(std::string& out, const std::string& s) {
+    out += '"';
+    for (char ch : s) {
+        if (ch == '"' || ch == '\\') out += '\\', out += ch;
+        else if ((unsigned char)ch < 0x20) out += ' ';
+        else out += ch;
+    }
+    out += '"';
+}
+
+// The constant buffers a shader binds: slot, size and its first floats (material values for a
+// pixel shader; for a skinned vertex shader the largest one holds the bone matrices).
+void JsonConstants(std::string& out, u64 shader) {
+    out += '[';
+    u64 hdr = shader ? Q(shader + SH_HEADER) : 0;
+    if (hdr && Readable(hdr, HDR_CB_INDEX + 0x18)) {
+        const s32 n = R<s32>(hdr + HDR_CB_MEMORY);
+        const u64 mem = Q(hdr + HDR_CB_MEMORY + 0x10), sizes = Q(hdr + HDR_CB_SIZE + 0x10),
+                  idx = Q(hdr + HDR_CB_INDEX + 0x10);
+        bool first = true;
+        for (s32 k = 0; k < n && k < 16; k++) {
+            const u64 data = Q(mem + k * 8);
+            const u32 size = (u32)R<u64>(sizes + k * 8), slot = R<u32>(idx + k * 4);
+            if (!data || !size || size > 65536 || !Readable(data, size)) continue;
+            char b[64];
+            snprintf(b, sizeof(b), "%s{\"slot\":%u,\"bytes\":%u,\"floats\":[", first ? "" : ",", slot, size);
+            out += b;
+            first = false;
+            for (u32 i = 0; i < size / 4 && i < 64; i++) {
+                const float f = R<float>(data + i * 4);
+                snprintf(b, sizeof(b), "%s%.6g", i ? "," : "", std::isfinite(f) ? f : 0.0f);
+                out += b;
+            }
+            out += "]}";
+        }
+    }
+    out += ']';
+}
+
+// One line of draws.jsonl, for the draw GfxDraw is making (called where F11's log line is written).
+void ModtestDraw(u64 ctx, u64 vsh, u64 psh, const ShaderInfo* vs, const ShaderInfo* ps, const ShaderInfo* gs,
+                 u32 prim, u32 count, bool indexed, u32 nrt, const char* depth_mode, const ViewportI& vp) {
+    if (!g_modtest_json) return;
+    std::string j = "{\"draw\":" + std::to_string(g_stats.draws) + ",\"vs\":";
+    JsonString(j, vs ? vs->name : "?");
+    j += ",\"ps\":";
+    JsonString(j, ps ? ps->name : "");
+    j += ",\"gs\":";
+    JsonString(j, gs ? gs->name : "");
+    const u32 blend = R<u32>(ctx + CTX_BLEND_CONTROL), mask = R<u32>(ctx + CTX_RT_MASK);
+    const u32 dctl = R<u32>(ctx + CTX_DEPTH_STENCIL_CONTROL);
+    const bool blends = (blend >> 30) & 1, discards = ps && ShaderDiscards(ps->bytecode);
+    // CB_BLEND0_CONTROL: colour src [4:0] fn [7:5] dst [12:8], alpha src [20:16] fn [23:21]
+    // dst [28:24], separate alpha 29, enable 30. DB_DEPTH_CONTROL: z test 1, z write 2, func [6:4].
+    char b[512];
+    snprintf(b, sizeof(b),
+             ",\"alpha\":\"%s\",\"discard\":%s,\"blend\":{\"enabled\":%s,\"raw\":\"%08x\",\"color_src\":%u,"
+             "\"color_fn\":%u,\"color_dst\":%u,\"alpha_src\":%u,\"alpha_fn\":%u,\"alpha_dst\":%u,\"separate\":%s},"
+             "\"rt_mask\":\"%08x\",\"depth\":{\"bound\":\"%s\",\"test\":%s,\"write\":%s,\"func\":%u,\"raw\":\"%08x\"},"
+             "\"prim\":%u,\"count\":%u,\"indexed\":%s,\"targets\":%u,\"viewport\":[%d,%d,%d,%d],"
+             "\"cull_setup\":\"%08x\",\"alpha_to_mask\":\"%08x\"",
+             blends ? "blend" : discards ? "clip" : "opaque", discards ? "true" : "false", blends ? "true" : "false",
+             blend, blend & 31, (blend >> 5) & 7, (blend >> 8) & 31, (blend >> 16) & 31, (blend >> 21) & 7,
+             (blend >> 24) & 31, (blend >> 29) & 1 ? "true" : "false", mask, depth_mode, (dctl >> 1) & 1 ? "true" : "false",
+             (dctl >> 2) & 1 ? "true" : "false", (dctl >> 4) & 7, dctl, prim, count, indexed ? "true" : "false", nrt,
+             vp.x, vp.y, vp.w, vp.h, R<u32>(ctx + CTX_PRIM_SETUP), R<u32>(ctx + CTX_ALPHA_TO_MASK));
+    j += b;
+    j += ",\"textures\":[";
+    bool first = true;
+    for (const auto& [stage, si, base] : {std::tuple{"ps", ps, (u64)CTX_PS_TEXTURES}, std::tuple{"vs", vs, (u64)CTX_VS_TEXTURES}}) {
+        if (!si) continue;
+        for (auto [slot, dims] : si->textures) {
+            const u64 t = Q(ctx + base + slot * 8);
+            if (!t || !Readable(t, 32)) continue;
+            const TSharp ts = DecodeTSharp((const u32*)t);
+            const char* kind = g_surfaces.count(ts.base) ? "render_target" : "asset";
+            snprintf(b, sizeof(b),
+                     "%s{\"stage\":\"%s\",\"slot\":%d,\"address\":\"%llx\",\"width\":%u,\"height\":%u,\"mips\":%u,"
+                     "\"gcn_format\":%u,\"gcn_number\":%u,\"dxgi\":%d,\"tiling\":%u,\"type\":%u,\"swizzle\":\"%03x\","
+                     "\"kind\":\"%s\"}",
+                     first ? "" : ",", stage, slot, (unsigned long long)ts.base, ts.width, ts.height,
+                     ts.last_level - ts.base_level + 1, ts.dfmt, ts.nfmt, (int)TextureFormat(ts.dfmt, ts.nfmt, ts.dst_sel),
+                     ts.tiling_index, ts.type, ts.dst_sel, kind);
+            j += b;
+            first = false;
+        }
+    }
+    j += "],\"vs_constants\":";
+    JsonConstants(j, vsh);
+    j += ",\"ps_constants\":";
+    JsonConstants(j, psh);
+    j += "}\n";
+    std::fwrite(j.data(), 1, j.size(), g_modtest_json);
+    g_modtest_draws++;
+}
+
+void ModtestWrite(const fs::path& path, const std::string& text) {
+    const fs::path tmp = fs::path(path).concat(L".tmp");
+    if (FILE* f = _wfopen(tmp.c_str(), L"wb")) {
+        std::fwrite(text.data(), 1, text.size(), f);
+        std::fclose(f);
+        std::error_code ec;
+        fs::rename(tmp, path, ec);
+    }
+}
+
+// At each present: a new request (<dir>/request), or the picture of the frame just captured.
+void ModtestPresent() {
+    const fs::path& dir = ModtestDir();
+    if (dir.empty()) return;
+    std::error_code ec;
+    if (g_modtest_stage == 2) {
+        const fs::path out = dir / g_modtest_name;
+        SaveScreenshot((out / "screen.bmp").string().c_str());
+        char b[256];
+        snprintf(b, sizeof(b),
+                 "{\"renderer\":\"d3d11\",\"frame\":%llu,\"draws\":%llu,\"renderdoc\":%s,\"picture\":\"screen.bmp\"}\n",
+                 (unsigned long long)g_frame, (unsigned long long)g_modtest_draws, RenderDoc() ? "true" : "false");
+        ModtestWrite(out / "done", b);
+        LOG("modtest: %s done (%llu draws)", g_modtest_name.c_str(), (unsigned long long)g_modtest_draws);
+        g_modtest_stage = 0;
+        g_modtest_name.clear();
+        return;
+    }
+    if (g_modtest_stage != 0 || g_frame % 10 != 0) return;
+    const fs::path request = dir / "request";
+    if (!fs::exists(request, ec)) return;
+    std::string name;
+    {
+        std::ifstream in(request);
+        std::getline(in, name);
+    }
+    fs::remove(request, ec);
+    while (!name.empty() && (name.back() == '\r' || name.back() == ' ')) name.pop_back();
+    if (name == "quit") {
+        LOG("modtest: asked to end the game");
+        if (g_log_mirror) std::fflush(g_log_mirror);
+        std::fflush(stdout);
+        ExitProcess(0);
+    }
+    // a plain folder name: letters, digits, '-', '_', '.'
+    bool ok = !name.empty() && name.size() < 64 && name[0] != '.';
+    for (char ch : name) ok = ok && (isalnum((unsigned char)ch) || ch == '-' || ch == '_' || ch == '.');
+    if (!ok) {
+        LOG("modtest: request \"%s\" ignored (a name of letters, digits, '-', '_' or '.')", name.c_str());
+        return;
+    }
+    g_modtest_name = name;
+    g_modtest_stage = 1;
+    g_capture_armed = true;
+    LOG("modtest: %s asked at frame %llu", name.c_str(), (unsigned long long)g_frame);
+}
+
 }  // namespace
 
 void GfxDraw(u32 count, u64 index_addr, bool indexed) {
@@ -2544,6 +2744,8 @@ void GfxDraw(u32 count, u64 index_addr, bool indexed) {
             vp.y, vp.w, vp.h, prim, count,
             indexed ? " indexed" : "", R<u32>(ctx + CTX_BLEND_CONTROL), R<u32>(ctx + CTX_RT_MASK), dctl,
             R<u32>(ctx + CTX_PRIM_SETUP), (unsigned long long)Q(ctx + CTX_RASTER_STATE), tx.c_str());
+        ModtestDraw(ctx, vsh, psh, vs, ps, gs, prim, count, indexed, nrt,
+                    dsv ? (dsv == (depth ? depth->dsv_ro.Get() : nullptr) ? "ro" : "rw") : "-", vp);
         {
             // RE aid: vertex buffer 0 and index buffer resource objects
             u64 rs = Q(ctx + CTX_VERTEX_BUFFERS), sm = Q(ctx + CTX_INDEX_BUFFER);
@@ -3003,12 +3205,19 @@ u32 GfxSnapshot(u64 addr) {
         }
         SaveCapture(g_capture_dir);
         if (g_log_mirror) std::fclose(std::exchange(g_log_mirror, nullptr));
+        if (g_modtest_json) std::fclose(std::exchange(g_modtest_json, nullptr));
+        if (g_modtest_stage == 1) g_modtest_stage = 2;  // its picture at the next present
     } else if (g_capture_armed) {
         g_capture_armed = false;
         std::error_code ec;
         g_capture_dir = UserRoot() / "capture" / ("frame_" + std::to_string(g_frame));
+        if (g_modtest_stage == 1) g_capture_dir = ModtestDir() / g_modtest_name;  // tools/modtest.py
         fs::create_directories(g_capture_dir, ec);
         g_log_mirror = _wfopen((g_capture_dir / "draws.txt").c_str(), L"w");
+        if (g_modtest_stage == 1) {
+            g_modtest_json = _wfopen((g_capture_dir / "draws.jsonl").c_str(), L"wb");
+            g_modtest_draws = 0;
+        }
         g_capture = g_capture_by_flip = true;
         LOG("cap: from this flip to the next, into %s", g_capture_dir.string().c_str());
         if (RENDERDOC_API_1_1_2* rd = RenderDoc()) {
@@ -3274,6 +3483,7 @@ void GfxPresent(u64 addr, ID3D11RenderTargetView* target, u32 snapshot) {
         snprintf(path, sizeof(path), "shot_%05llu.bmp", (unsigned long long)g_frame);
         SaveScreenshot(path);
     }
+    ModtestPresent();  // BB_MODTEST_DIR only
     g_swap_rtv.Reset();
 }
 

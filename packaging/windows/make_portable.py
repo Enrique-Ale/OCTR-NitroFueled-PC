@@ -304,6 +304,7 @@ def main():
     # lang/: the port's translations, read by scripts/octr_texts.py at start-up (online_mode.py, tacho_pack.py)
     shutil.copytree(ROOT / 'lang', folder / 'lang', dirs_exist_ok=True)
     shutil.copy2(ROOT / 'tools' / 'gen_import_names.py', folder / 'tools')
+    shutil.copy2(ROOT / 'tools' / 'modtest.py', folder / 'tools')  # lab: mod test runs (docs/modtest.md)
     # The native Vulkan renderer's shader build (scripts/native_shaders.py): the translator, its
     # driver script and DXC. Only dxc.exe and dxcompiler.dll: SPIR-V needs no dxil.dll.
     (folder / 'tools' / 'shaders').mkdir()
