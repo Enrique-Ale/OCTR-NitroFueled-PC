@@ -1,0 +1,49 @@
+# Pista A: solo V6 (fila 1, casilla 3), Leo/need (fila 1, casilla 5) y Racing (fila 2, casilla 2).
+# Usa el mismo skins.pad (cursor en la primera skin). "Derecha" da la vuelta dentro de la fila.
+# python tools/modtest.py tools/modtest_routes/ruta_pista_a_3skins.txt --out pista_a_neon07 --renderdoc "C:\Program Files\RenderDoc\renderdoc.dll" --shot-timeout 300
+waitlog gfx: D3D11 device ready 900
+wait 30
+replay skins.pad
+wait 4
+press right 0.06
+wait 4
+press right 0.06
+wait 4
+shot v6_frente
+hold rx=255 0.5
+wait 2
+shot v6_lado
+hold rx=255 0.5
+wait 2
+shot v6_espalda
+hold rx=0 1.0
+wait 3
+press right 0.06
+wait 4
+press right 0.06
+wait 4
+shot leoneed_frente
+hold rx=255 0.5
+wait 2
+shot leoneed_lado
+hold rx=255 0.5
+wait 2
+shot leoneed_espalda
+hold rx=0 1.0
+wait 3
+press right 0.06
+wait 4
+press down 0.06
+wait 4
+press right 0.06
+wait 4
+shot racing_frente
+hold rx=255 0.5
+wait 2
+shot racing_lado
+hold rx=255 0.5
+wait 2
+shot racing_espalda
+hold rx=0 1.0
+wait 3
+quit
