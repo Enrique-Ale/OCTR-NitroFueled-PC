@@ -82,6 +82,29 @@ class Route:
         self.replay = next(iter(replays), None)
 
 
+def launcher_game_dir():
+    """The game folder the launcher uses (launcher.ini game_dir), else the portable package's
+    CUSA13795-1.21 next to it, as "Jugar CTR Nitro-Fueled.bat" does."""
+    data = Path(os.environ.get('BB_DATA_DIR') or PORT)
+    try:
+        for line in (data / 'launcher.ini').read_text(encoding='utf-8', errors='replace').splitlines():
+            name, sep, value = line.partition('=')
+            if sep and name.strip() == 'game_dir' and value.strip() and Path(value.strip()).is_dir():
+                return value.strip()
+    except OSError:
+        pass
+    return str(PORT / 'CUSA13795-1.21') if (PORT / 'CUSA13795-1.21').is_dir() else None
+
+
+def tell_ended(game):
+    """The game's last lines, when it ended on its own."""
+    with game.cond:
+        tail = game.lines[-8:]
+    print('modtest: the game ended. Its last lines:', file=sys.stderr)
+    for line in tail:
+        print('    ' + line, file=sys.stderr)
+
+
 class Game:
     """The game started the way its launchers do (run.py on Windows, run.sh on Linux), its output
     kept in game.log and watched for waitlog steps."""
@@ -91,9 +114,11 @@ class Game:
         self.cond = threading.Condition()
         self.done = False
         self.log = open(log_path, 'w', encoding='utf-8', errors='replace')
+        if not env.get('BB_GAME_DIR'):
+            game = launcher_game_dir()
+            if game:
+                env['BB_GAME_DIR'] = game
         if WINDOWS:
-            if not env.get('BB_GAME_DIR') and (PORT / 'CUSA13795-1.21').is_dir():
-                env['BB_GAME_DIR'] = str(PORT / 'CUSA13795-1.21')  # as "Jugar CTR Nitro-Fueled.bat"
             command = [sys.executable, '-X', 'utf8', 'run.py']
             extra = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP}
         else:
@@ -197,6 +222,7 @@ def run(args):
         for number, cmd, step in route.steps:
             if not game.alive():
                 failure = f'the game ended before step {number} ({cmd})'
+                tell_ended(game)
                 break
             if time.monotonic() > deadline:
                 failure = f'--timeout reached at step {number}'
@@ -274,6 +300,11 @@ def record(args):
     out = Path(args.record).resolve().parent
     game = Game(env, out / (Path(args.record).name + '.game.log'))
     game.proc.wait()
+    time.sleep(0.5)  # the last lines
+    if not Path(env['BB_PAD_RECORD']).is_file():
+        tell_ended(game)
+        print('modtest: no recording made (F9 in the game window starts it, F9 again stops it)', file=sys.stderr)
+        return 1
     return 0
 
 
@@ -287,7 +318,10 @@ def main(argv=None):
     p.add_argument('--timeout', type=float, default=1200, help='the whole run, seconds (default 1200)')
     p.add_argument('--shot-timeout', type=float, default=120, help='one shot, seconds (default 120)')
     p.add_argument('--record', help='record a route (.pad) instead of running one')
+    p.add_argument('--game', help="the game folder (BB_GAME_DIR); default: the launcher's (launcher.ini game_dir)")
     args = p.parse_args(argv)
+    if args.game:
+        os.environ['BB_GAME_DIR'] = str(Path(args.game).resolve())
     if args.record:
         return record(args)
     if not args.route or not args.out:
