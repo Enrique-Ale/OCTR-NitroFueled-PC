@@ -1,0 +1,37 @@
+# Una toma por cada skin del corredor en la pantalla de skins (rejilla de 5 + 3).
+# Graba antes el pad: python tools/modtest.py --record tools/modtest_routes/skins.pad
+#   F9 en la pantalla de título, entra hasta la rejilla de skins, deja el cursor
+#   en la PRIMERA skin (arriba a la izquierda), espera 1 s, F9 otra vez y cierra.
+# Luego: python tools/modtest.py tools/modtest_routes/todas_las_skins.txt --out skins1 --game <carpeta del juego>
+# (sin --renderdoc: 8 capturas .rdc pesan ~600 MB; úsalo solo en la skin que se quiera depurar)
+waitlog gfx: D3D11 device ready 900
+wait 30
+replay skins.pad
+wait 4
+shot skin1
+press right
+wait 3
+shot skin2
+press right
+wait 3
+shot skin3
+press right
+wait 3
+shot skin4
+press right
+wait 3
+shot skin5
+press left
+press left
+press left
+press left
+press down
+wait 3
+shot skin6
+press right
+wait 3
+shot skin7
+press right
+wait 3
+shot skin8
+quit
