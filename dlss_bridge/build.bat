@@ -7,6 +7,13 @@ if "%SDK%"=="" goto usage
 if "%VKINC%"=="" goto usage
 for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VS=%%i
 call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
+rem Only the Vulkan headers: a MinGW include folder (MSYS2's clang64\include) also holds its own C
+rem runtime headers (stdlib.h, yvals.h...), which /I would put in front of MSVC's.
+set VKONLY=%TEMP%\sacredfire_vk_include
+if exist "%VKONLY%" rmdir /s /q "%VKONLY%"
+xcopy /e /i /q /y "%VKINC%\vulkan" "%VKONLY%\vulkan" >nul || exit /b 1
+if exist "%VKINC%\vk_video" xcopy /e /i /q /y "%VKINC%\vk_video" "%VKONLY%\vk_video" >nul
+set VKINC=%VKONLY%
 cd /d "%~dp0"
 cl /nologo /O2 /MT /EHsc /std:c++20 /LD /DNOMINMAX /DWIN32_LEAN_AND_MEAN /I"%SDK%\include" /I"%VKINC%" ^
    shadps4_dlss_bridge.cpp /Fo"%TEMP%\\" /link "%SDK%\lib\Windows_x86_64\x64\nvsdk_ngx_s.lib" ^

@@ -1,0 +1,12 @@
+# tools/modtest.py example: from the start to a recorded menu screen, two shots, then the end.
+# Record the menu part once:  python tools/modtest.py --record tools/modtest_routes/menu.pad
+# (F9 on the title screen, walk to the racer, F9 again, close the game). Then:
+#   python tools/modtest.py tools/modtest_routes/example.txt --out modtest/run1
+waitlog gfx: D3D11 device ready 900   # Direct3D 11 is up (the first start translates shaders)
+wait 30                               # intro videos and the title screen
+replay menu.pad                       # the recorded route, played back
+wait 4                                # the racer's idle pose settles
+shot front
+wait 1.5
+shot later                            # the same scene a moment later (animation, blinking)
+quit

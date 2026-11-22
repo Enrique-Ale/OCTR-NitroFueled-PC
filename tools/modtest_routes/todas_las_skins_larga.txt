@@ -1,0 +1,112 @@
+# Ronda larga de depuración: 4 tomas por cada una de las 8 skins, con RenderDoc.
+# Usa el mismo skins.pad que todas_las_skins.txt (cursor en la PRIMERA skin al terminar).
+# python tools/modtest.py tools/modtest_routes/todas_las_skins_larga.txt --out larga1 --renderdoc "C:\Program Files\RenderDoc\renderdoc.dll" --shot-timeout 300
+# Por skin: frente, frente un momento después (animación y parpadeo), girada a un lado y girada de espaldas.
+# El giro es con el stick derecho (ROTATE); los tiempos de giro son una estimación.
+waitlog gfx: D3D11 device ready 900
+wait 30
+replay skins.pad
+wait 4
+shot s1_frente
+wait 1.7
+shot s1_despues
+hold rx=255 0.5
+wait 2
+shot s1_lado
+hold rx=255 0.5
+wait 2
+shot s1_espalda
+hold rx=0 1.0
+wait 3
+press right 0.06
+wait 4
+shot s2_frente
+wait 1.7
+shot s2_despues
+hold rx=255 0.5
+wait 2
+shot s2_lado
+hold rx=255 0.5
+wait 2
+shot s2_espalda
+hold rx=0 1.0
+wait 3
+press right 0.06
+wait 4
+shot s3_frente
+wait 1.7
+shot s3_despues
+hold rx=255 0.5
+wait 2
+shot s3_lado
+hold rx=255 0.5
+wait 2
+shot s3_espalda
+hold rx=0 1.0
+wait 3
+press right 0.06
+wait 4
+shot s4_frente
+wait 1.7
+shot s4_despues
+hold rx=255 0.5
+wait 2
+shot s4_lado
+hold rx=255 0.5
+wait 2
+shot s4_espalda
+hold rx=0 1.0
+wait 3
+press right 0.06
+wait 4
+shot s5_frente
+wait 1.7
+shot s5_despues
+hold rx=255 0.5
+wait 2
+shot s5_lado
+hold rx=255 0.5
+wait 2
+shot s5_espalda
+hold rx=0 1.0
+wait 3
+press right 0.06
+wait 4
+shot s6_frente
+wait 1.7
+shot s6_despues
+hold rx=255 0.5
+wait 2
+shot s6_lado
+hold rx=255 0.5
+wait 2
+shot s6_espalda
+hold rx=0 1.0
+wait 3
+press right 0.06
+wait 4
+shot s7_frente
+wait 1.7
+shot s7_despues
+hold rx=255 0.5
+wait 2
+shot s7_lado
+hold rx=255 0.5
+wait 2
+shot s7_espalda
+hold rx=0 1.0
+wait 3
+press right 0.06
+wait 4
+shot s8_frente
+wait 1.7
+shot s8_despues
+hold rx=255 0.5
+wait 2
+shot s8_lado
+hold rx=255 0.5
+wait 2
+shot s8_espalda
+hold rx=0 1.0
+wait 3
+quit
