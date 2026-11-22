@@ -399,14 +399,7 @@ sys.modules['discord_ipc'] = types.SimpleNamespace(Presence=Client, Activity=typ
         g_app.game_running = false;
         DestroyTray();
     } else assert(!EnsureTray());
-    // as launcher/linux/main.inc: SDL_RENDER_DRIVER, else the GPU renderers; a headless runner whose
-    // GPU drivers SDL cannot reach (Xvfb under nix-shell) draws the same UI with SDL's software one
-    const char* render_driver = SDL_getenv("SDL_RENDER_DRIVER");
-    g_renderer = SDL_CreateRenderer(g_app.hwnd, render_driver && *render_driver ? render_driver : "vulkan,opengl,opengles2");
-    if (!g_renderer) {
-        std::fprintf(stderr, "launcher-ui-test: no GPU renderer (%s): software\n", SDL_GetError());
-        g_renderer = SDL_CreateRenderer(g_app.hwnd, "software");
-    }
+    g_renderer = SDL_CreateRenderer(g_app.hwnd, "vulkan,opengl,opengles2");
     assert(g_renderer);
     ImGui::CreateContext();
     ImGui::GetIO().IniFilename = nullptr;
