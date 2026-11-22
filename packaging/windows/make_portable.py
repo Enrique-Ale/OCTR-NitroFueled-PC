@@ -305,6 +305,7 @@ def main():
     shutil.copytree(ROOT / 'lang', folder / 'lang', dirs_exist_ok=True)
     shutil.copy2(ROOT / 'tools' / 'gen_import_names.py', folder / 'tools')
     shutil.copy2(ROOT / 'tools' / 'modtest.py', folder / 'tools')  # lab: mod test runs (docs/modtest.md)
+    shutil.copytree(ROOT / 'tools' / 'modtest_routes', folder / 'tools' / 'modtest_routes', dirs_exist_ok=True)
     # The native Vulkan renderer's shader build (scripts/native_shaders.py): the translator, its
     # driver script and DXC. Only dxc.exe and dxcompiler.dll: SPIR-V needs no dxil.dll.
     (folder / 'tools' / 'shaders').mkdir()

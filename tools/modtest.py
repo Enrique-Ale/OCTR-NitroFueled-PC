@@ -298,6 +298,7 @@ def record(args):
         env['BB_RENDERER'] = args.renderer
     print(f'Recording into {env["BB_PAD_RECORD"]}: F9 starts, F9 stops; then close the game.')
     out = Path(args.record).resolve().parent
+    out.mkdir(parents=True, exist_ok=True)
     game = Game(env, out / (Path(args.record).name + '.game.log'))
     game.proc.wait()
     time.sleep(0.5)  # the last lines
