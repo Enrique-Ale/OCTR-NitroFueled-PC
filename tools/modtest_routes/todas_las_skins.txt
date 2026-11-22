@@ -3,7 +3,7 @@
 #   F9 en la pantalla de título, entra hasta la rejilla de skins, deja el cursor
 #   en la PRIMERA skin (arriba a la izquierda), espera 1 s, F9 otra vez y cierra.
 # Luego: python tools/modtest.py tools/modtest_routes/todas_las_skins.txt --out skins1
-# Solo usa "derecha": la rejilla da la vuelta de la última a la primera. Pulsación corta
+# Ojo: "derecha" da la vuelta dentro de la fila (5 skins); la segunda fila va en skins_fila2_larga.txt. Pulsación corta
 # y espera larga, porque una pulsación de 0.15 s llegó a mover el cursor dos casillas.
 # (sin --renderdoc: 8 capturas .rdc pesan ~600 MB; úsalo solo en la skin que se quiera depurar)
 waitlog gfx: D3D11 device ready 900
