@@ -20,6 +20,8 @@ uint64_t runtime_np_calculate_account_id(const char *name) {
     return hash;
 }
 void runtime_net_trace(const char *format, ...) { (void)format; }
+int runtime_party_server_create(const char *sid) { (void)sid; return 0; }  /* RyuNET party mirror (5765656) */
+int runtime_party_server_join(const char *sid) { (void)sid; return 0; }
 
 int main(void) {
     char sessions[] = "/tmp/ctr-session-test-XXXXXX";
